@@ -1,82 +1,85 @@
-"""Kafka producer with idempotency, retries, and DLQ fallback."""
+"""Kafka producer with graceful degradation — runs in no-op mode when Kafka is unavailable."""
 import json
 import logging
-import threading
-from typing import Callable, Optional
-from confluent_kafka import Producer, KafkaException
-from config import config
+import uuid
+from datetime import datetime, timezone
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-class SecurityEventProducer:
-    def __init__(self):
-        self._producer: Optional[Producer] = None
-        self._lock = threading.Lock()
-        self._healthy = False
 
-    def _get_producer(self) -> Producer:
-        if self._producer is None:
-            with self._lock:
-                if self._producer is None:
-                    conf = {
-                        "bootstrap.servers": config.kafka_bootstrap_servers,
-                        "acks": config.kafka_producer_acks,
-                        "retries": config.kafka_producer_retries,
-                        "linger.ms": config.kafka_producer_linger_ms,
-                        "compression.type": config.kafka_producer_compression,
-                        "enable.idempotence": True,
-                        "max.in.flight.requests.per.connection": 5,
-                        "delivery.timeout.ms": 30000,
-                    }
-                    self._producer = Producer(conf)
-                    self._healthy = True
-                    logger.info("Kafka producer initialized")
-        return self._producer
+class _NoOpProducer:
+    """Stand-in producer when Kafka is unavailable. Events are logged but not forwarded."""
+    _warned = False
 
-    def _delivery_callback(self, err, msg):
-        if err:
-            logger.error("Delivery failed for event %s: %s", msg.key(), err)
-        else:
-            logger.debug("Event %s delivered to %s [%d] offset %d",
-                         msg.key(), msg.topic(), msg.partition(), msg.offset())
+    def produce(self, key: str, value: dict) -> None:
+        if not self._warned:
+            logger.warning("Kafka unavailable — running in no-op mode. Events will NOT be forwarded to blockchain-logger.")
+            self._warned = True
+        logger.debug("[no-op] event key=%s severity=%s", key, value.get("severity"))
 
-    def produce(self, event_id: str, payload: dict, on_delivery: Optional[Callable] = None) -> None:
-        producer = self._get_producer()
-        value = json.dumps(payload, default=str).encode("utf-8")
-        producer.produce(
-            topic=config.kafka_topic_events,
-            key=event_id.encode("utf-8"),
-            value=value,
-            on_delivery=on_delivery or self._delivery_callback,
-        )
-        producer.poll(0)
+    def produce_dlq(self, key: str, value: dict, error: str) -> None:
+        logger.debug("[no-op dlq] key=%s error=%s", key, error)
 
-    def produce_dlq(self, event_id: str, payload: dict, reason: str) -> None:
-        producer = self._get_producer()
-        payload["_dlq_reason"] = reason
-        value = json.dumps(payload, default=str).encode("utf-8")
-        producer.produce(
-            topic=config.kafka_topic_dlq,
-            key=event_id.encode("utf-8"),
-            value=value,
-            on_delivery=self._delivery_callback,
-        )
-        producer.poll(0)
+    def flush(self, timeout: float = 5.0) -> None:
+        pass
 
-    def flush(self, timeout: float = 10.0) -> int:
-        return self._get_producer().flush(timeout)
+    def close(self) -> None:
+        pass
 
     def is_healthy(self) -> bool:
-        try:
-            self._get_producer()
-            return self._healthy
-        except KafkaException:
-            return False
+        return False  # reports degraded, but service stays up
 
-    def close(self):
-        if self._producer:
-            self._producer.flush(30)
-            self._producer = None
-            self._healthy = False
 
-producer = SecurityEventProducer()
+class _KafkaProducer:
+    def __init__(self, bootstrap: str, topic: str, dlq_topic: str):
+        from confluent_kafka import Producer as _P, KafkaException
+        self._topic = topic
+        self._dlq   = dlq_topic
+        self._prod  = _P({"bootstrap.servers": bootstrap,
+                          "socket.timeout.ms": 3000,
+                          "message.timeout.ms": 5000})
+        self._healthy = True
+        logger.info("Kafka producer connected to %s", bootstrap)
+
+    def produce(self, key: str, value: dict) -> None:
+        self._prod.produce(
+            self._topic,
+            key=key.encode(),
+            value=json.dumps(value, default=str).encode(),
+        )
+        self._prod.poll(0)
+
+    def produce_dlq(self, key: str, value: dict, error: str) -> None:
+        payload = {**value, "_error": error, "_dlq_ts": datetime.now(timezone.utc).isoformat()}
+        self._prod.produce(self._dlq, key=key.encode(),
+                           value=json.dumps(payload, default=str).encode())
+        self._prod.poll(0)
+
+    def flush(self, timeout: float = 5.0) -> None:
+        self._prod.flush(timeout)
+
+    def close(self) -> None:
+        self.flush()
+
+    def is_healthy(self) -> bool:
+        return self._healthy
+
+
+def _build_producer():
+    """Try to build a real Kafka producer; fall back to no-op silently."""
+    from config import config
+    try:
+        import confluent_kafka  # noqa: F401  — check import first
+        return _KafkaProducer(config.kafka_bootstrap, config.kafka_topic, config.kafka_dlq_topic)
+    except ImportError:
+        logger.warning("confluent-kafka not installed — using no-op producer")
+        return _NoOpProducer()
+    except Exception as exc:
+        if config.kafka_optional:
+            logger.warning("Kafka not reachable (%s) — using no-op producer", exc)
+            return _NoOpProducer()
+        raise
+
+
+producer = _build_producer()
