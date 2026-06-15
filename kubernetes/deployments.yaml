@@ -1,0 +1,165 @@
+# Kubernetes deployments for services
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: detector-adapter
+  labels:
+    app: detector-adapter
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: detector-adapter
+  template:
+    metadata:
+      labels:
+        app: detector-adapter
+    spec:
+      containers:
+        - name: detector-adapter
+          image: detector-adapter:latest
+          ports:
+            - containerPort: 8000
+            - containerPort: 9090
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                configMapKeyRef:
+                  name: pipeline-config
+                  key: kafka_bootstrap_servers
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blockchain-logger
+  labels:
+    app: blockchain-logger
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: blockchain-logger
+  template:
+    metadata:
+      labels:
+        app: blockchain-logger
+    spec:
+      containers:
+        - name: blockchain-logger
+          image: blockchain-logger:latest
+          ports:
+            - containerPort: 9091
+          volumeMounts:
+            - name: fabric-certs
+              mountPath: /certs
+              readOnly: true
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+      volumes:
+        - name: fabric-certs
+          secret:
+            secretName: fabric-tls-certs
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: audit-api
+  labels:
+    app: audit-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: audit-api
+  template:
+    metadata:
+      labels:
+        app: audit-api
+    spec:
+      containers:
+        - name: audit-api
+          image: audit-api:latest
+          ports:
+            - containerPort: 8001
+            - containerPort: 9092
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: detector-adapter-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: detector-adapter
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: blockchain-logger-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: blockchain-logger
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pipeline-config
+data:
+  kafka_bootstrap_servers: "kafka:9092"
+  kafka_topic_events: "security-events"
+  kafka_consumer_group: "blockchain-logger-group"
+  fabric_channel_name: "security-channel"
+  fabric_chaincode_name: "security_logger"
+  fabric_msp_id: "Org1MSP"
+  log_level: "INFO"
+  ipfs_api_url: "http://ipfs:5001"
+  ipfs_gateway_url: "http://ipfs:8080"
+  audit_api_url: "http://audit-api:8001"

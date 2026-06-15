@@ -1,0 +1,66 @@
+# Kubernetes services for the security logging pipeline
+apiVersion: v1
+kind: Service
+metadata:
+  name: detector-adapter
+  labels:
+    app: detector-adapter
+spec:
+  selector:
+    app: detector-adapter
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: blockchain-logger-metrics
+  labels:
+    app: blockchain-logger
+spec:
+  selector:
+    app: blockchain-logger
+  ports:
+    - name: metrics
+      port: 9091
+      targetPort: 9091
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: audit-api
+  labels:
+    app: audit-api
+spec:
+  selector:
+    app: audit-api
+  ports:
+    - name: http
+      port: 8001
+      targetPort: 8001
+    - name: metrics
+      port: 9092
+      targetPort: 9092
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: compliance-scheduler-metrics
+  labels:
+    app: compliance-scheduler
+spec:
+  selector:
+    app: compliance-scheduler
+  ports:
+    - name: metrics
+      port: 9093
+      targetPort: 9093
+  type: ClusterIP
