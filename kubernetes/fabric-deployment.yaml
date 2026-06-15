@@ -1,0 +1,387 @@
+# kubernetes/fabric-deployment.yaml
+# Kubernetes manifests for Objective 2 — Hyperledger Fabric + IPFS
+# Deploys: Fabric CA, Orderer, Peer0 (CouchDB), IPFS
+#
+# Prerequisites:
+#   kubectl apply -f kubernetes/fabric-deployment.yaml
+#   Secrets: crypto-config materials must be stored in Kubernetes Secrets
+#            (see scripts/create-k8s-secrets.sh)
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fabric
+---
+# ---------------------------------------------------------------------------
+# Fabric CA Deployment
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fabric-ca
+  namespace: fabric
+  labels:
+    app: fabric-ca
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fabric-ca
+  template:
+    metadata:
+      labels:
+        app: fabric-ca
+    spec:
+      containers:
+        - name: fabric-ca
+          image: hyperledger/fabric-ca:1.5
+          command: ["sh", "-c", "fabric-ca-server start -b admin:adminpw -d"]
+          env:
+            - name: FABRIC_CA_HOME
+              value: /etc/hyperledger/fabric-ca-server
+            - name: FABRIC_CA_SERVER_CA_NAME
+              value: ca.org1.example.com
+            - name: FABRIC_CA_SERVER_TLS_ENABLED
+              value: "true"
+          ports:
+            - containerPort: 7054
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /cainfo
+              port: 7054
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fabric-ca
+  namespace: fabric
+spec:
+  selector:
+    app: fabric-ca
+  ports:
+    - port: 7054
+      targetPort: 7054
+---
+# ---------------------------------------------------------------------------
+# Orderer Deployment
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orderer
+  namespace: fabric
+  labels:
+    app: orderer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orderer
+  template:
+    metadata:
+      labels:
+        app: orderer
+    spec:
+      containers:
+        - name: orderer
+          image: hyperledger/fabric-orderer:2.5
+          command: ["orderer"]
+          env:
+            - name: FABRIC_LOGGING_SPEC
+              value: INFO
+            - name: ORDERER_GENERAL_LISTENADDRESS
+              value: 0.0.0.0
+            - name: ORDERER_GENERAL_LISTENPORT
+              value: "7050"
+            - name: ORDERER_GENERAL_LOCALMSPID
+              value: OrdererMSP
+            - name: ORDERER_GENERAL_TLS_ENABLED
+              value: "true"
+          ports:
+            - containerPort: 7050
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orderer
+  namespace: fabric
+spec:
+  selector:
+    app: orderer
+  ports:
+    - port: 7050
+      targetPort: 7050
+---
+# ---------------------------------------------------------------------------
+# CouchDB for Peer0
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: couchdb0
+  namespace: fabric
+  labels:
+    app: couchdb0
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: couchdb0
+  template:
+    metadata:
+      labels:
+        app: couchdb0
+    spec:
+      containers:
+        - name: couchdb
+          image: couchdb:3.3
+          env:
+            - name: COUCHDB_USER
+              value: admin
+            - name: COUCHDB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: couchdb-secret
+                  key: password
+          ports:
+            - containerPort: 5984
+          volumeMounts:
+            - name: couchdb-storage
+              mountPath: /opt/couchdb/data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 5984
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: couchdb-storage
+          persistentVolumeClaim:
+            claimName: couchdb0-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: couchdb0
+  namespace: fabric
+spec:
+  selector:
+    app: couchdb0
+  ports:
+    - port: 5984
+      targetPort: 5984
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: couchdb0-pvc
+  namespace: fabric
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+# ---------------------------------------------------------------------------
+# Peer0 Deployment
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: peer0-org1
+  namespace: fabric
+  labels:
+    app: peer0-org1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: peer0-org1
+  template:
+    metadata:
+      labels:
+        app: peer0-org1
+    spec:
+      containers:
+        - name: peer
+          image: hyperledger/fabric-peer:2.5
+          command: ["peer", "node", "start"]
+          env:
+            - name: CORE_VM_ENDPOINT
+              value: unix:///host/var/run/docker.sock
+            - name: FABRIC_LOGGING_SPEC
+              value: INFO
+            - name: CORE_PEER_TLS_ENABLED
+              value: "true"
+            - name: CORE_PEER_ID
+              value: peer0.org1.example.com
+            - name: CORE_PEER_ADDRESS
+              value: peer0-org1:7051
+            - name: CORE_PEER_LOCALMSPID
+              value: Org1MSP
+            - name: CORE_LEDGER_STATE_STATEDATABASE
+              value: CouchDB
+            - name: CORE_LEDGER_STATE_COUCHDBCONFIG_COUCHDBADDRESS
+              value: couchdb0:5984
+            - name: CORE_LEDGER_STATE_COUCHDBCONFIG_USERNAME
+              value: admin
+            - name: CORE_LEDGER_STATE_COUCHDBCONFIG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: couchdb-secret
+                  key: password
+          ports:
+            - containerPort: 7051
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: 2000m
+              memory: 2Gi
+          livenessProbe:
+            exec:
+              command: ["peer", "node", "status"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+      volumes:
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: peer0-org1
+  namespace: fabric
+spec:
+  selector:
+    app: peer0-org1
+  ports:
+    - port: 7051
+      targetPort: 7051
+---
+# ---------------------------------------------------------------------------
+# IPFS Deployment — off-chain payload storage
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ipfs
+  namespace: fabric
+  labels:
+    app: ipfs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ipfs
+  template:
+    metadata:
+      labels:
+        app: ipfs
+    spec:
+      containers:
+        - name: ipfs
+          image: ipfs/kubo:v0.28.0
+          env:
+            - name: IPFS_PROFILE
+              value: server
+          ports:
+            - containerPort: 5001   # API
+            - containerPort: 8080   # Gateway
+            - containerPort: 4001   # Swarm
+          volumeMounts:
+            - name: ipfs-storage
+              mountPath: /data/ipfs
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+          readinessProbe:
+            exec:
+              command: ["ipfs", "id"]
+            initialDelaySeconds: 20
+            periodSeconds: 15
+      volumes:
+        - name: ipfs-storage
+          persistentVolumeClaim:
+            claimName: ipfs-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ipfs-pvc
+  namespace: fabric
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ipfs
+  namespace: fabric
+spec:
+  selector:
+    app: ipfs
+  ports:
+    - name: api
+      port: 5001
+      targetPort: 5001
+    - name: gateway
+      port: 8080
+      targetPort: 8080
+---
+# ---------------------------------------------------------------------------
+# Horizontal Pod Autoscaler — scales peer replicas under load
+# ---------------------------------------------------------------------------
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: peer0-org1-hpa
+  namespace: fabric
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: peer0-org1
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

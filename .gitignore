@@ -1,6 +1,41 @@
-chaincode/vendor/
-chaincode/vendor/
-chaincode/vendor/
-fabric-samples/chaincode/security_logger/vendor/
+# Crypto materials — NEVER commit private keys to the repo
+crypto-config/
+channel-artifacts/
+
+# Secret keys
+*.key
+*.pem
+*_sk
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
 venv/
-secret.key
+.env
+
+# Go
+vendor/
+*.test
+
+# Docker
+.docker/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+logs/
+
+# fabric-samples submodule (populated at runtime)
+fabric-samples/
