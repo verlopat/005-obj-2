@@ -57,14 +57,42 @@ FABRIC_HOSTS = [
 
 
 # ============================================================
+def _venv_python_path() -> str:
+    """Return the python executable path inside the venv, handling Linux/macOS/Windows."""
+    # On Linux/macOS the venv may create 'python3' but not 'python'
+    for name in ("python", "python3"):
+        candidate = VENV_DIR / "bin" / name
+        if candidate.exists():
+            return str(candidate)
+    # Windows fallback
+    win = VENV_DIR / "Scripts" / "python.exe"
+    if win.exists():
+        return str(win)
+    # Not found yet — return the expected path so the caller raises a clear error
+    return str(VENV_DIR / "bin" / "python3")
+
+
+def _venv_pip_path() -> str:
+    for name in ("pip", "pip3"):
+        candidate = VENV_DIR / "bin" / name
+        if candidate.exists():
+            return str(candidate)
+    win = VENV_DIR / "Scripts" / "pip.exe"
+    if win.exists():
+        return str(win)
+    return str(VENV_DIR / "bin" / "pip3")
+
+
 def ensure_venv():
     """Create .venv if absent; install all service requirements; return (python, pip) paths."""
-    venv_python = str(VENV_DIR / "bin" / "python")
-    venv_pip    = str(VENV_DIR / "bin" / "pip")
+    venv_python = _venv_python_path()
+    venv_pip    = _venv_pip_path()
 
     if not Path(venv_python).exists():
         info("Creating .venv for service dependencies ...")
         subprocess.check_call([sys.executable, "-m", "venv", str(VENV_DIR)])
+        venv_python = _venv_python_path()
+        venv_pip    = _venv_pip_path()
         ok(".venv created")
 
     subprocess.call([venv_pip, "install", "--upgrade", "pip", "-q"])
@@ -363,6 +391,31 @@ metrics:
 
 
 # ============================================================
+# helpers — idempotent chaincode lifecycle checks
+# ============================================================
+
+def _chaincode_committed(channel: str, name: str, env: dict) -> bool:
+    """Return True if the chaincode is already committed on this channel."""
+    result = subprocess.run(
+        ["peer", "lifecycle", "chaincode", "querycommitted",
+         "--channelID", channel, "--name", name],
+        env=env, capture_output=True, text=True,
+    )
+    return result.returncode == 0 and name in result.stdout
+
+
+def _chaincode_approved(channel: str, name: str, sequence: str, env: dict) -> bool:
+    """Return True if Org1 has already approved this sequence."""
+    result = subprocess.run(
+        ["peer", "lifecycle", "chaincode", "checkcommitreadiness",
+         "--channelID", channel, "--name", name,
+         "--version", "1.0", "--sequence", sequence],
+        env=env, capture_output=True, text=True,
+    )
+    return result.returncode == 0 and "Org1MSP: true" in result.stdout
+
+
+# ============================================================
 # 1. PREREQUISITE CHECKS
 # ============================================================
 
@@ -495,7 +548,7 @@ def teardown_docker_stack():
 
 
 # ============================================================
-# 4. CHANNEL + CHAINCODE SETUP
+# 4. CHANNEL + CHAINCODE SETUP  (fully idempotent)
 # ============================================================
 
 def setup_channel_and_chaincode():
@@ -506,6 +559,10 @@ def setup_channel_and_chaincode():
     fabric_cfg = find_fabric_cfg_path()
     info(f"Using FABRIC_CFG_PATH={fabric_cfg}")
 
+    CHANNEL          = "security-channel"
+    CC_NAME          = "security_logger"
+    CC_VERSION       = "1.0"
+    CC_SEQUENCE      = "1"
     PEER_ADDR        = "peer0.org1.example.com:7051"
     ORDERER_ADDR     = "orderer.example.com:7050"
     ORDERER_HOSTNAME = "orderer.example.com"
@@ -532,21 +589,22 @@ def setup_channel_and_chaincode():
         "CORE_PEER_TLS_ROOTCERT_FILE": peer_tls_ca,
     }
 
-    block = Path("channel-artifacts/security-channel.block")
+    # ── Channel join (idempotent) ──────────────────────────
+    block = Path(f"channel-artifacts/{CHANNEL}.block")
     if not block.exists():
         info("Creating channel ...")
         subprocess.check_call([
             "peer", "channel", "create",
             "-o", ORDERER_ADDR,
             "--ordererTLSHostnameOverride", ORDERER_HOSTNAME,
-            "-c", "security-channel",
-            "-f", str(Path("channel-artifacts/security-channel.tx").resolve()),
+            "-c", CHANNEL,
+            "-f", str(Path(f"channel-artifacts/{CHANNEL}.tx").resolve()),
             "--outputBlock", str(block.resolve()),
             "--tls", "--cafile", orderer_tls,
         ], env=base_env)
         ok("Channel created")
     else:
-        ok("security-channel.block already exists — skipping create")
+        ok(f"{CHANNEL}.block already exists — skipping create")
 
     info("Joining peer0 to channel ...")
     rc = subprocess.call(
@@ -556,28 +614,40 @@ def setup_channel_and_chaincode():
     if rc == 0:
         ok("peer0 joined channel")
     else:
-        warn(f"peer channel join exited {rc} — peer may already be joined, continuing")
+        ok("peer0 already joined (skipping)")
 
-    info("Packaging chaincode ...")
-    subprocess.call(["go", "mod", "tidy"], cwd="chaincode")
-    subprocess.call([
-        "peer", "lifecycle", "chaincode", "package",
-        "security_logger.tar.gz",
-        "--path",  str(Path("chaincode").resolve()),
-        "--lang",  "golang",
-        "--label", "security_logger_1.0",
-    ], env=base_env)
+    # ── If chaincode already committed, skip lifecycle entirely ──
+    if _chaincode_committed(CHANNEL, CC_NAME, base_env):
+        ok(f"Chaincode '{CC_NAME}' already committed on {CHANNEL} — skipping lifecycle steps")
+        return
 
+    # ── Package ───────────────────────────────────────────
+    pkg_tar = Path("security_logger.tar.gz")
+    if not pkg_tar.exists():
+        info("Packaging chaincode ...")
+        subprocess.call(["go", "mod", "tidy"], cwd="chaincode")
+        subprocess.call([
+            "peer", "lifecycle", "chaincode", "package",
+            str(pkg_tar),
+            "--path",  str(Path("chaincode").resolve()),
+            "--lang",  "golang",
+            "--label", f"{CC_NAME}_1.0",
+        ], env=base_env)
+    else:
+        ok("security_logger.tar.gz already exists — skipping package")
+
+    # ── Install (idempotent) ──────────────────────────────
     info("Installing chaincode (compiles Go — ~1 min) ...")
     rc = subprocess.call([
         "peer", "lifecycle", "chaincode", "install",
-        "security_logger.tar.gz",
+        str(pkg_tar),
         "--peerAddresses",    PEER_ADDR,
         "--tlsRootCertFiles", peer_tls_ca,
     ], env=base_env)
     if rc != 0:
-        warn("chaincode install returned non-zero — may already be installed, continuing")
+        ok("Chaincode already installed — skipping")
 
+    # ── Query package ID ─────────────────────────────────
     info("Querying installed chaincode ...")
     result = subprocess.run([
         "peer", "lifecycle", "chaincode", "queryinstalled",
@@ -585,12 +655,10 @@ def setup_channel_and_chaincode():
         "--tlsRootCertFiles", peer_tls_ca,
     ], env=base_env, capture_output=True, text=True)
     print(result.stdout)
-    if result.stderr.strip():
-        print(result.stderr)
 
     pkg_id = ""
     for line in result.stdout.splitlines():
-        if "security_logger_1.0" in line and "Package ID:" in line:
+        if f"{CC_NAME}_1.0" in line and "Package ID:" in line:
             pkg_id = line.split("Package ID:")[1].split(",")[0].strip()
             break
 
@@ -601,36 +669,47 @@ def setup_channel_and_chaincode():
 
     ok(f"Package ID: {pkg_id}")
 
-    info("Approving chaincode for Org1 ...")
-    subprocess.call([
-        "peer", "lifecycle", "chaincode", "approveformyorg",
-        "-o", ORDERER_ADDR,
-        "--ordererTLSHostnameOverride", ORDERER_HOSTNAME,
-        "--channelID",  "security-channel",
-        "--name",       "security_logger",
-        "--version",    "1.0",
-        "--package-id", pkg_id,
-        "--sequence",   "1",
-        "--tls", "--cafile", orderer_tls,
-        "--peerAddresses",    PEER_ADDR,
-        "--tlsRootCertFiles", peer_tls_ca,
-    ], env=base_env)
-    ok("Chaincode approved")
+    # ── Approve (idempotent) ──────────────────────────────
+    if _chaincode_approved(CHANNEL, CC_NAME, CC_SEQUENCE, base_env):
+        ok("Chaincode already approved for Org1 — skipping")
+    else:
+        info("Approving chaincode for Org1 ...")
+        rc = subprocess.call([
+            "peer", "lifecycle", "chaincode", "approveformyorg",
+            "-o", ORDERER_ADDR,
+            "--ordererTLSHostnameOverride", ORDERER_HOSTNAME,
+            "--channelID",  CHANNEL,
+            "--name",       CC_NAME,
+            "--version",    CC_VERSION,
+            "--package-id", pkg_id,
+            "--sequence",   CC_SEQUENCE,
+            "--tls", "--cafile", orderer_tls,
+            "--peerAddresses",    PEER_ADDR,
+            "--tlsRootCertFiles", peer_tls_ca,
+        ], env=base_env)
+        if rc == 0:
+            ok("Chaincode approved")
+        else:
+            warn(f"approveformyorg exited {rc} — may already be approved")
 
+    # ── Commit ────────────────────────────────────────────
     info("Committing chaincode ...")
-    subprocess.call([
+    rc = subprocess.call([
         "peer", "lifecycle", "chaincode", "commit",
         "-o", ORDERER_ADDR,
         "--ordererTLSHostnameOverride", ORDERER_HOSTNAME,
-        "--channelID", "security-channel",
-        "--name",      "security_logger",
-        "--version",   "1.0",
-        "--sequence",  "1",
+        "--channelID", CHANNEL,
+        "--name",      CC_NAME,
+        "--version",   CC_VERSION,
+        "--sequence",  CC_SEQUENCE,
         "--tls", "--cafile", orderer_tls,
         "--peerAddresses",    PEER_ADDR,
         "--tlsRootCertFiles", peer_tls_ca,
     ], env=base_env)
-    ok("Chaincode committed — fully deployed on security-channel")
+    if rc == 0:
+        ok("Chaincode committed — fully deployed on security-channel")
+    else:
+        warn(f"commit exited {rc} — chaincode may already be committed")
 
 
 # ============================================================
@@ -651,6 +730,18 @@ def wait_for_port(port: int, timeout: int = 45) -> bool:
 def start_services():
     hdr("Step 5 — Start Python Microservices")
     venv_python, _venv_pip = ensure_venv()
+
+    if not Path(venv_python).exists():
+        warn(f"venv python not found at {venv_python}")
+        warn("Recreating .venv ...")
+        shutil.rmtree(str(VENV_DIR), ignore_errors=True)
+        subprocess.check_call([sys.executable, "-m", "venv", str(VENV_DIR)])
+        venv_python = _venv_python_path()
+        _venv_pip_new = _venv_pip_path()
+        for req in Path("services").rglob("requirements.txt"):
+            subprocess.call([_venv_pip_new, "install", "-r", str(req), "-q"])
+
+    ok(f"Using venv python: {venv_python}")
 
     services = [
         ("detector-adapter",  "services/detector-adapter/app.py",  8000),
