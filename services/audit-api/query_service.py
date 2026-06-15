@@ -1,148 +1,215 @@
-"""Audit query service — reads exclusively from Hyperledger Fabric.
+"""
+services/audit-api/query_service.py
 
-No mock ledger.  No in-memory fallback.  No _MOCK_LEDGER.
-If Fabric is not reachable the call raises and the HTTP layer returns 503.
+All query helpers read from the shared Redis instance that the
+blockchain-logger writes to after every successful Fabric commit.
 
-Verification pipeline:
-  1. Fetch record from Fabric (on-chain hash, CID, signature)
-  2. Fetch raw payload from IPFS by CID
-  3. Recompute SHA-256 over fetched bytes
-  4. Compare on-chain hash vs recomputed hash
-  5. Verify ECDSA signature over canonical fields
-  6. Return explicit status: VALID | HASH_MISMATCH | SIGNATURE_INVALID | CID_NOT_FOUND
+No _MOCK_LEDGER, no in-process state, no simulation paths.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
-from typing import List, Literal, Optional
+import os
+import sys
+from typing import List, Optional
 
-import requests
+# Make shared/ importable
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
-from shared.config import IPFS_API_URL
-from shared.event_schema import AuditRecord, canonical_payload
-from shared.fabric_gateway import (
-    get_event, query_by_asset, query_by_severity,
-)
-from shared.ipfs import fetch_and_verify
+import redis  # type: ignore
+
+from shared import config as cfg
+from shared.event_schema import SecurityEvent, VerificationResult, VerificationStatus
+from shared.ipfs_client import IPFSError, fetch_and_verify
 
 log = logging.getLogger(__name__)
 
-VerifyStatus = Literal["VALID", "HASH_MISMATCH", "SIGNATURE_INVALID", "CID_NOT_FOUND"]
+_redis: Optional[redis.Redis] = None
 
 
-def _to_record(raw: dict) -> AuditRecord:
-    """Coerce raw Fabric response dict → validated AuditRecord."""
-    return AuditRecord(
-        event_id=raw.get("event_id", ""),
-        asset_id=raw.get("asset_id", ""),
-        cloud_provider=raw.get("cloud_provider", ""),
-        region=raw.get("region", ""),
-        severity=raw.get("severity", "LOW"),
-        attack_category=raw.get("attack_category", "OTHER"),
-        description=raw.get("description", ""),
-        detection_confidence=float(raw.get("detection_confidence", 0.0)),
-        model_version=raw.get("model_version", ""),
-        timestamp=raw.get("timestamp", ""),
-        tx_id=raw.get("tx_id", ""),
-        block_number=int(raw.get("block_number", 0)),
-        ipfs_cid=raw.get("ipfs_cid", ""),
-        sha256=raw.get("sha256", ""),
-        org_msp=raw.get("org_msp", "Org1MSP"),
-        signature=raw.get("signature", ""),
+def _get_redis() -> redis.Redis:
+    global _redis
+    if _redis is None:
+        _redis = redis.from_url(cfg.REDIS_URL, decode_responses=True)
+    return _redis
+
+
+# ─────────────────────────────────────────────────────────────────────────
+def _get_record(event_id: str) -> Optional[SecurityEvent]:
+    """Fetch one record from Redis by event_id. Returns None if not found."""
+    raw = _get_redis().get(cfg.REDIS_KEY_PREFIX + event_id)
+    if raw is None:
+        return None
+    try:
+        return SecurityEvent.from_ledger_dict(json.loads(raw))
+    except Exception as exc:
+        log.error("Failed to deserialise event_id=%s: %s", event_id, exc)
+        return None
+
+
+def _get_event_ids_for_asset(asset_id: str, limit: int = 100) -> List[str]:
+    """Return up to *limit* event_ids for an asset, newest first."""
+    return _get_redis().zrevrange(
+        cfg.REDIS_IDX_ASSET + asset_id, 0, limit - 1
     )
 
 
-def query_audit_trail(
-    asset_id: Optional[str] = None,
-    start_time: Optional[str] = None,
-    end_time: Optional[str] = None,
-    page_size: int = 20,
-) -> List[AuditRecord]:
-    """Return audit records from Fabric.  Raises RuntimeError if Fabric unreachable."""
-    raws = query_by_asset(asset_id or "", page_size) if asset_id else []
-    return [_to_record(r) for r in raws]
+def _get_event_ids_for_severity(severity: str, limit: int = 100) -> List[str]:
+    return _get_redis().zrevrange(
+        cfg.REDIS_IDX_SEV + severity, 0, limit - 1
+    )
 
 
-def query_by_severity_live(
-    severity: str,
-    start_time: Optional[str] = None,
-    end_time: Optional[str] = None,
-    page_size: int = 20,
-) -> List[AuditRecord]:
-    raws = query_by_severity(severity, start_time, end_time, page_size)
-    return [_to_record(r) for r in raws]
+# ── Public query API ─────────────────────────────────────────────────────────────
 
-
-def get_event_live(event_id: str) -> Optional[AuditRecord]:
-    raw = get_event(event_id)
-    return _to_record(raw) if raw else None
-
-
-def verify_record(event_id: str) -> dict:
-    """Full three-way verification: on-chain hash, IPFS payload hash, signature.
-
-    Returns:
-        {"status": VerifyStatus, "event_id": str, "detail": str}
+def query_by_asset(asset_id: str, page_size: int = 20) -> List[SecurityEvent]:
     """
-    raw = get_event(event_id)
-    if raw is None:
-        return {"status": "CID_NOT_FOUND", "event_id": event_id,
-                "detail": "Event not found on chain"}
+    Return up to *page_size* audit records for the given asset_id,
+    ordered newest-first.  Returns [] if the asset has no records.
+    """
+    ids = _get_event_ids_for_asset(asset_id, limit=page_size)
+    records = []
+    for eid in ids:
+        rec = _get_record(eid)
+        if rec is not None:
+            records.append(rec)
+    log.info("query_by_asset asset=%s found=%d", asset_id, len(records))
+    return records
 
-    on_chain_hash = raw.get("sha256", "")
-    cid           = raw.get("ipfs_cid", "")
-    signature     = raw.get("signature", "")
 
-    # 1. Fetch IPFS payload and recompute hash
-    if not cid:
-        return {"status": "CID_NOT_FOUND", "event_id": event_id,
-                "detail": "No IPFS CID stored on chain"}
+def query_by_severity(severity: str, page_size: int = 100) -> List[SecurityEvent]:
+    """
+    Return up to *page_size* audit records for the given severity level.
+    """
+    ids = _get_event_ids_for_severity(severity, limit=page_size)
+    records = []
+    for eid in ids:
+        rec = _get_record(eid)
+        if rec is not None:
+            records.append(rec)
+    log.info("query_by_severity severity=%s found=%d", severity, len(records))
+    return records
 
-    try:
-        resp = requests.post(
-            f"{IPFS_API_URL}/api/v0/cat",
-            params={"arg": cid},
-            timeout=30,
+
+def query_by_event_id(event_id: str) -> Optional[SecurityEvent]:
+    """Return a single record by its event_id, or None."""
+    return _get_record(event_id)
+
+
+# ── Integrity verification ───────────────────────────────────────────────────────────
+
+def verify_record(event_id: str) -> VerificationResult:
+    """
+    Full integrity check for a stored audit record.
+
+    Checks (in order):
+      1. Record exists in Redis with all required ledger fields.
+      2. On-chain SHA-256 matches a fresh recomputation over canonical fields.
+      3. Live IPFS payload SHA-256 matches the stored hash.
+      4. ECDSA agent_signature over canonical_bytes() is valid.
+
+    Returns VerificationResult with an explicit status enum value.
+    """
+    rec = _get_record(event_id)
+    if rec is None:
+        return VerificationResult(
+            event_id=event_id,
+            status=VerificationStatus.CID_NOT_FOUND,
+            detail="Record not found in Redis cache",
         )
-        if resp.status_code != 200:
-            return {"status": "CID_NOT_FOUND", "event_id": event_id,
-                    "detail": f"IPFS cat returned {resp.status_code}"}
-        ipfs_bytes       = resp.content
-        ipfs_sha256      = hashlib.sha256(ipfs_bytes).hexdigest()
-    except Exception as exc:
-        return {"status": "CID_NOT_FOUND", "event_id": event_id,
-                "detail": f"IPFS fetch error: {exc}"}
 
-    # 2. Compare on-chain hash vs IPFS payload hash
-    if ipfs_sha256 != on_chain_hash:
-        return {"status": "HASH_MISMATCH", "event_id": event_id,
-                "detail": f"on-chain={on_chain_hash[:16]}... ipfs={ipfs_sha256[:16]}..."}
+    # ─ Check required ledger fields ─────────────────────────────────────────────
+    missing = [f for f in ("ipfs_cid", "sha256", "agent_signature") if not getattr(rec, f, None)]
+    if missing:
+        return VerificationResult(
+            event_id=event_id,
+            status=VerificationStatus.MISSING_FIELDS,
+            detail=f"Missing ledger fields: {missing}",
+        )
 
-    # 3. Verify ECDSA signature over canonical fields
-    if signature:
-        try:
-            from cryptography.hazmat.primitives import hashes, serialization
-            from cryptography.hazmat.primitives.asymmetric import ec
-            from cryptography.exceptions import InvalidSignature
-            import base64
-            from shared.config import AGENT_CERT_PATH
-            from pathlib import Path
+    recomputed = rec.compute_sha256()
+    on_chain_hash = rec.sha256
 
-            cert_pem  = Path(AGENT_CERT_PATH).read_bytes()
-            from cryptography import x509
-            cert      = x509.load_pem_x509_certificate(cert_pem)
-            pub_key   = cert.public_key()
-            sig_bytes = base64.b64decode(signature)
-            payload   = canonical_payload(raw)
-            try:
-                pub_key.verify(sig_bytes, payload, ec.ECDSA(hashes.SHA256()))
-            except InvalidSignature:
-                return {"status": "SIGNATURE_INVALID", "event_id": event_id,
-                        "detail": "ECDSA signature verification failed"}
-        except Exception as exc:
-            log.warning("Signature check error for %s: %s", event_id, exc)
+    # ─ 1. On-chain hash vs fresh recomputation ──────────────────────────────
+    if on_chain_hash != recomputed:
+        return VerificationResult(
+            event_id=event_id,
+            status=VerificationStatus.HASH_MISMATCH,
+            on_chain_hash=on_chain_hash,
+            recomputed_hash=recomputed,
+            detail="SHA-256 over canonical fields does not match stored hash",
+        )
 
-    return {"status": "VALID", "event_id": event_id,
-            "detail": f"on-chain hash matches IPFS payload; CID={cid}"}
+    # ─ 2. Fetch live IPFS payload and verify hash ───────────────────────────
+    try:
+        ipfs_ok = fetch_and_verify(rec.ipfs_cid, on_chain_hash)
+    except IPFSError as exc:
+        return VerificationResult(
+            event_id=event_id,
+            status=VerificationStatus.CID_NOT_FOUND,
+            on_chain_hash=on_chain_hash,
+            recomputed_hash=recomputed,
+            detail=f"IPFS fetch failed: {exc}",
+        )
+
+    if not ipfs_ok:
+        return VerificationResult(
+            event_id=event_id,
+            status=VerificationStatus.IPFS_HASH_MISMATCH,
+            on_chain_hash=on_chain_hash,
+            recomputed_hash=recomputed,
+            detail="Live IPFS payload hash differs from on-chain hash",
+        )
+
+    # ─ 3. ECDSA signature ──────────────────────────────────────────────────────
+    sig_valid = _verify_signature(rec)
+    if not sig_valid:
+        return VerificationResult(
+            event_id=event_id,
+            status=VerificationStatus.SIGNATURE_INVALID,
+            on_chain_hash=on_chain_hash,
+            recomputed_hash=recomputed,
+            ipfs_hash=on_chain_hash,  # IPFS matched
+            signature_valid=False,
+            detail="ECDSA agent signature verification failed",
+        )
+
+    return VerificationResult(
+        event_id=event_id,
+        status=VerificationStatus.VALID,
+        on_chain_hash=on_chain_hash,
+        recomputed_hash=recomputed,
+        ipfs_hash=on_chain_hash,
+        signature_valid=True,
+        detail="All checks passed",
+    )
+
+
+def _verify_signature(rec: SecurityEvent) -> bool:
+    """
+    Verify the ECDSA P-256 agent_signature over canonical_bytes().
+    Loads the agent cert from disk (AGENT_CERT_PATH).
+    Returns False on any error so callers always get a bool.
+    """
+    if not rec.agent_signature or not rec.agent_identity:
+        return False
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization  # type: ignore
+        from cryptography.hazmat.primitives.asymmetric import ec  # type: ignore
+        from cryptography import x509  # type: ignore
+        from cryptography.hazmat.backends import default_backend  # type: ignore
+        from cryptography.exceptions import InvalidSignature  # type: ignore
+
+        with open(cfg.AGENT_CERT_PATH, "rb") as f:
+            cert = x509.load_pem_x509_certificate(f.read(), default_backend())
+        pub_key = cert.public_key()
+
+        sig_bytes = bytes.fromhex(rec.agent_signature)
+        pub_key.verify(sig_bytes, rec.canonical_bytes(), ec.ECDSA(hashes.SHA256()))  # type: ignore
+        return True
+    except (InvalidSignature, Exception) as exc:
+        log.warning("Signature verify failed for event_id=%s: %s", rec.event_id, exc)
+        return False

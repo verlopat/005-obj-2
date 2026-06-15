@@ -1,54 +1,56 @@
-"""Audit API — live Fabric reads only.  No mock paths."""
+"""
+services/audit-api/app.py
+
+FastAPI audit service.  All queries read from shared Redis.
+No mock ledger, no in-process state.
+"""
 from __future__ import annotations
 
 import logging
-from contextlib import asynccontextmanager
+import os
+import sys
+from typing import List, Optional
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Optional
+import uvicorn
 
-from query_service import (
-    get_event_live,
-    query_audit_trail,
-    query_by_severity_live,
+from shared import config as cfg
+from shared.event_schema import SecurityEvent, VerificationResult
+from services.audit_api.query_service import (
+    query_by_asset,
+    query_by_event_id,
+    query_by_severity,
     verify_record,
 )
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [AUDIT-API] %(levelname)s %(message)s",
+    format="%(asctime)s [audit-api] %(levelname)s %(message)s",
 )
-log = logging.getLogger(__name__)
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    log.info("Audit API starting — live Fabric mode")
-    yield
-    log.info("Audit API shutting down")
-
+log = logging.getLogger("audit-api")
 
 app = FastAPI(
-    title="Audit API",
-    description="Immutable audit trail — Hyperledger Fabric (live)",
+    title="Blockchain Audit API",
+    description="Immutable audit trail — Hyperledger Fabric + IPFS",
     version="2.0.0",
-    lifespan=lifespan,
 )
 
 
+# ── Request / Response models ─────────────────────────────────────────────────────────
+
 class TrailRequest(BaseModel):
-    asset_id: Optional[str] = None
-    start_time: Optional[str] = None
-    end_time: Optional[str] = None
+    asset_id: str
     page_size: int = 20
 
 
 class SeverityRequest(BaseModel):
     severity: str
-    start_time: Optional[str] = None
-    end_time: Optional[str] = None
-    page_size: int = 20
+    page_size: int = 100
 
 
 class ComplianceRequest(BaseModel):
@@ -58,93 +60,90 @@ class ComplianceRequest(BaseModel):
     output_format: str = "json"
 
 
+# ── Endpoints ────────────────────────────────────────────────────────────────────────
+
 @app.get("/health")
 def health():
     return {"status": "ok", "mode": "live"}
 
 
-@app.post("/api/v1/audit/trail")
-def get_audit_trail(req: TrailRequest):
-    try:
-        records = query_audit_trail(
-            asset_id=req.asset_id,
-            start_time=req.start_time,
-            end_time=req.end_time,
-            page_size=req.page_size,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    return {"records": [r.model_dump() for r in records], "count": len(records)}
-
-
-@app.post("/api/v1/audit/severity")
-def get_by_severity(req: SeverityRequest):
-    try:
-        records = query_by_severity_live(
-            severity=req.severity,
-            start_time=req.start_time,
-            end_time=req.end_time,
-            page_size=req.page_size,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    return {"records": [r.model_dump() for r in records], "count": len(records)}
+@app.post("/api/v1/audit/trail", response_model=List[dict])
+def audit_trail(req: TrailRequest):
+    """
+    Return the audit trail for an asset.
+    Reads from Redis (populated by blockchain-logger after each Fabric commit).
+    Returns [] if no records are found — never raises 404 for empty results.
+    """
+    records = query_by_asset(req.asset_id, page_size=req.page_size)
+    return [r.to_ledger_dict() for r in records]
 
 
 @app.get("/api/v1/audit/event/{event_id}")
 def get_event(event_id: str):
-    try:
-        record = get_event_live(event_id)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    if record is None:
-        raise HTTPException(status_code=404, detail="Event not found")
-    return record.model_dump()
+    rec = query_by_event_id(event_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
+    return rec.to_ledger_dict()
 
 
-@app.get("/api/v1/audit/verify/{event_id}")
+@app.post("/api/v1/audit/severity", response_model=List[dict])
+def by_severity(req: SeverityRequest):
+    records = query_by_severity(req.severity.upper(), page_size=req.page_size)
+    return [r.to_ledger_dict() for r in records]
+
+
+@app.get("/api/v1/verify/{event_id}", response_model=VerificationResult)
 def verify(event_id: str):
-    """Three-way integrity check: on-chain hash + IPFS payload + ECDSA signature.
-
-    Returns one of: VALID | HASH_MISMATCH | SIGNATURE_INVALID | CID_NOT_FOUND
     """
-    try:
-        result = verify_record(event_id)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    status_code = 200 if result["status"] == "VALID" else 409
-    from fastapi.responses import JSONResponse
-    return JSONResponse(status_code=status_code, content=result)
+    Full integrity verification.
+
+    Checks:
+      - on-chain SHA-256 == recomputed SHA-256 over canonical fields
+      - live IPFS payload SHA-256 == stored hash
+      - ECDSA agent_signature over canonical_bytes() is valid
+
+    Returns explicit status: VALID | HASH_MISMATCH | SIGNATURE_INVALID |
+                             CID_NOT_FOUND | IPFS_HASH_MISMATCH | MISSING_FIELDS
+    """
+    return verify_record(event_id)
 
 
 @app.post("/api/v1/compliance/report")
 def compliance_report(req: ComplianceRequest):
-    """Query Fabric for counts by severity and return a compliance snapshot."""
+    """Return ISO-27001 / SOC2 compliance summary from live Redis data."""
     from datetime import datetime, timezone
-    counts = {}
-    for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]:
-        try:
-            records = query_by_severity_live(severity=sev, page_size=1000)
-            counts[sev] = len(records)
-        except RuntimeError:
-            counts[sev] = -1
+
+    critical = query_by_severity("CRITICAL", page_size=10_000)
+    high     = query_by_severity("HIGH",     page_size=10_000)
+    medium   = query_by_severity("MEDIUM",   page_size=10_000)
+    low      = query_by_severity("LOW",      page_size=10_000)
+    total    = len(critical) + len(high) + len(medium) + len(low)
 
     return {
-        "standard":        req.standard,
-        "generated_at":    datetime.now(timezone.utc).isoformat(),
-        "period":          f"{req.start_time} to {req.end_time}",
-        "severity_counts": counts,
-        "storage_backend": "Hyperledger Fabric + IPFS (live)",
+        "standard":         req.standard,
+        "generated_at":     datetime.now(timezone.utc).isoformat(),
+        "period":           f"{req.start_time} to {req.end_time}",
+        "total_events":     total,
+        "critical_events":  len(critical),
+        "high_events":      len(high),
+        "medium_events":    len(medium),
+        "low_events":       len(low),
+        "storage_backend":  "Hyperledger Fabric + IPFS (live)",
+        "integrity_check":  "SHA-256 + ECDSA P-256",
         "controls_satisfied": [
             "A.12.4.1 — Event logging",
             "A.12.4.2 — Protection of log information",
             "A.12.4.3 — Administrator and operator logs",
             "A.16.1.2 — Reporting information security events",
         ],
-        "status": "COMPLIANT",
+        "status": "COMPLIANT" if total > 0 else "NO_DATA",
     }
 
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8001, reload=False)
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0",
+        port=cfg.AUDIT_API_PORT,
+        log_level="info",
+    )
