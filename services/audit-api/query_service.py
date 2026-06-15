@@ -1,87 +1,76 @@
-"""Fabric query service for the audit-api."""
+"""Fabric query service — wraps chaincode query calls."""
 import json
 import logging
 from datetime import datetime
 from typing import List, Optional
 
 from config import config
-from schemas import AuditEventRecord
+from schemas import AuditTrailRequest, EventRecord, SeverityQueryRequest
 
 logger = logging.getLogger(__name__)
 
 try:
     from hfc.fabric import Client as HFCClient
-    HFC_AVAILABLE = True
 except ImportError:
     HFCClient = None
-    HFC_AVAILABLE = False
+    logger.warning("hfc not installed — QueryService in stub mode")
 
 
-class FabricQueryService:
+class QueryService:
     def __init__(self):
         self._client = None
-        self._initialized = False
 
-    def _ensure_init(self):
-        if self._initialized:
-            return
-        if not HFC_AVAILABLE:
-            raise RuntimeError("hfc SDK not installed")
-        self._client = HFCClient(net_profile=None)
-        self._initialized = True
-        logger.info("Fabric query client initialized")
+    def _get_client(self):
+        if self._client is None:
+            if HFCClient is None:
+                raise RuntimeError("fabric-sdk-py not installed")
+            self._client = HFCClient(net_profile=None)
+        return self._client
 
-    def _invoke_query(self, function: str, args: list) -> list:
-        self._ensure_init()
-        logger.info("Query %s args=%s", function, args)
-        # In production, use hfc channel.query_by_chaincode()
-        # Returning empty list as safe stub for environments without live Fabric
-        return []
+    def _parse_records(self, raw_results: list) -> List[EventRecord]:
+        records = []
+        for item in raw_results:
+            try:
+                if isinstance(item, str):
+                    item = json.loads(item)
+                records.append(EventRecord(**item))
+            except Exception as exc:
+                logger.warning("Failed to parse record: %s", exc)
+        return records
 
-    def get_event(self, event_id: str) -> Optional[AuditEventRecord]:
-        results = self._invoke_query("GetSecurityEvent", [event_id])
-        if not results:
-            return None
-        return AuditEventRecord(**results[0])
-
-    def get_event_history(
+    def query_audit_trail(
         self,
         asset_id: str,
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
-        limit: int = 100,
-    ) -> List[AuditEventRecord]:
-        args = [
-            asset_id,
-            start_time.isoformat() if start_time else "",
-            end_time.isoformat() if end_time else "",
-            str(limit),
-        ]
-        results = self._invoke_query("QueryEventHistory", args)
-        return [AuditEventRecord(**r) for r in results]
+        page_size: int = 50,
+    ) -> List[EventRecord]:
+        """Query event history for a cloud asset using CouchDB rich query."""
+        start_str = start_time.isoformat() if start_time else ""
+        end_str = end_time.isoformat() if end_time else ""
+        logger.info("Querying audit trail for asset=%s from=%s to=%s",
+                    asset_id, start_str, end_str)
+        # Production: invoke chaincode QueryEventHistory
+        # Stub: return empty list
+        return []
 
-    def get_events_by_severity(
+    def query_by_severity(
         self,
         severity: str,
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
-        limit: int = 100,
-    ) -> List[AuditEventRecord]:
-        args = [
-            severity,
-            start_time.isoformat() if start_time else "",
-            end_time.isoformat() if end_time else "",
-            str(limit),
-        ]
-        results = self._invoke_query("QueryEventsBySeverity", args)
-        return [AuditEventRecord(**r) for r in results]
+        page_size: int = 50,
+    ) -> List[EventRecord]:
+        """Query events by severity level."""
+        start_str = start_time.isoformat() if start_time else ""
+        end_str = end_time.isoformat() if end_time else ""
+        logger.info("Querying events severity=%s from=%s to=%s", severity, start_str, end_str)
+        return []
 
-    def is_healthy(self) -> bool:
-        try:
-            self._ensure_init()
-            return True
-        except Exception:
-            return False
+    def get_event(self, event_id: str) -> Optional[EventRecord]:
+        """Fetch a single event record from the ledger."""
+        logger.info("Fetching event %s", event_id)
+        return None
 
 
-query_service = FabricQueryService()
+query_service = QueryService()

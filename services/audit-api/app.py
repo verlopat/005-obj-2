@@ -1,83 +1,83 @@
-"""Audit API — FastAPI service exposing audit trail queries and compliance reports."""
+"""Audit API — FastAPI service for blockchain audit trail queries and compliance reports."""
 import logging
 from datetime import datetime
-from typing import Literal, Optional
+from typing import List, Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
-from prometheus_client import Counter, make_asgi_app
+from fastapi import FastAPI, HTTPException, Query, status
+from fastapi.responses import PlainTextResponse
 
 from config import config
-from fabric_query import fabric_query
-from report_generator import report_generator
+from query_service import query_service
+from report_service import report_service
+from schemas import (
+    AuditTrailRequest, ComplianceReport, ComplianceReportRequest,
+    ComplianceStandard, EventRecord, IntegrityCheckRequest,
+    IntegrityCheckResult, SeverityQueryRequest,
+)
 
 logging.basicConfig(level=getattr(logging, config.log_level),
                     format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-QUERIES = Counter("audit_api_queries_total", "Audit API query count", ["endpoint"])
-
-app = FastAPI(title="Security Audit API", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-app.mount("/metrics", make_asgi_app())
-
+app = FastAPI(
+    title="Blockchain Audit API",
+    description="Query immutable security event records from Hyperledger Fabric",
+    version="1.0.0",
+)
 
 @app.get("/healthz")
-def health():
-    return {"status": "ok"}
+async def health():
+    return {"status": "ok", "version": "1.0.0"}
 
+@app.post("/api/v1/audit/trail", response_model=List[EventRecord])
+async def get_audit_trail(req: AuditTrailRequest):
+    try:
+        return query_service.query_audit_trail(
+            asset_id=req.asset_id,
+            start_time=req.start_time,
+            end_time=req.end_time,
+            page_size=req.page_size,
+        )
+    except Exception as exc:
+        logger.exception("Audit trail query failed")
+        raise HTTPException(status_code=500, detail=str(exc))
 
-@app.get("/api/v1/events/{event_id}")
-def get_event(event_id: str):
-    QUERIES.labels(endpoint="get_event").inc()
-    result = fabric_query.get_event(event_id)
-    if not result:
-        raise HTTPException(404, detail=f"Event {event_id} not found")
-    return result
+@app.post("/api/v1/audit/severity", response_model=List[EventRecord])
+async def query_by_severity(req: SeverityQueryRequest):
+    try:
+        return query_service.query_by_severity(
+            severity=req.severity,
+            start_time=req.start_time,
+            end_time=req.end_time,
+            page_size=req.page_size,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
+@app.get("/api/v1/audit/event/{event_id}", response_model=EventRecord)
+async def get_event(event_id: str):
+    record = query_service.get_event(event_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
+    return record
 
-@app.get("/api/v1/audit/history")
-def get_history(
-    asset_id: str,
-    start: str = Query(..., description="ISO8601 start datetime"),
-    end:   str = Query(..., description="ISO8601 end datetime"),
-):
-    QUERIES.labels(endpoint="history").inc()
-    return fabric_query.query_history(asset_id, start, end)
-
-
-@app.get("/api/v1/audit/severity")
-def get_by_severity(
-    severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"],
-    start: str = Query(...),
-    end:   str = Query(...),
-):
-    QUERIES.labels(endpoint="by_severity").inc()
-    return fabric_query.query_by_severity(severity, start, end)
-
-
-@app.get("/api/v1/reports")
-def generate_report(
-    framework: Literal["ISO27001", "SOC2", "NIST_SP_800_92", "GENERIC"] = "GENERIC",
-    start: str = Query(...),
-    end:   str = Query(...),
-    fmt: Literal["json", "csv"] = "json",
-    severity: Optional[Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]] = None,
-):
-    QUERIES.labels(endpoint="report").inc()
-    if severity:
-        events = fabric_query.query_by_severity(severity, start, end)
-    else:
-        result = fabric_query.get_all_events()
-        events = result.get("records", []) if isinstance(result, dict) else result
-    content = report_generator.generate(events, framework, start, end, fmt)
-    media_type = "application/json" if fmt == "json" else "text/csv"
-    filename   = f"compliance_report_{framework}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.{fmt}"
-    return Response(content=content, media_type=media_type,
-                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
-
+@app.post("/api/v1/compliance/report", response_model=ComplianceReport)
+async def generate_report(req: ComplianceReportRequest):
+    try:
+        report = report_service.generate_report(
+            standard=req.standard,
+            start_time=req.start_time,
+            end_time=req.end_time,
+            asset_ids=req.asset_ids,
+        )
+        if req.output_format == "csv":
+            csv_data = report_service.export_csv(report.events)
+            return PlainTextResponse(content=csv_data, media_type="text/csv")
+        return report
+    except Exception as exc:
+        logger.exception("Report generation failed")
+        raise HTTPException(status_code=500, detail=str(exc))
 
 if __name__ == "__main__":
-    uvicorn.run("app:app", host=config.api_host, port=config.api_port, workers=config.api_workers)
+    uvicorn.run("app:app", host=config.api_host, port=config.api_port)

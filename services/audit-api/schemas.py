@@ -5,70 +5,68 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
+class ComplianceStandard(str, Enum):
+    ISO_27001 = "ISO-27001"
+    SOC2 = "SOC-2"
+    NIST_800_92 = "NIST-SP-800-92"
+    PCI_DSS = "PCI-DSS"
+    GDPR = "GDPR"
 
-class ComplianceFramework(str, Enum):
-    ISO_27001 = "ISO27001"
-    SOC2 = "SOC2"
-    NIST_800_92 = "NIST800-92"
-    PCI_DSS = "PCIDSS"
-
-
-class AuditEventRecord(BaseModel):
+class EventRecord(BaseModel):
     event_id: str
     asset_id: str
-    cloud_provider: str
-    region: str
     severity: str
     attack_category: str
     description: str
     ipfs_cid: str
     sha256: str
     tx_id: str
-    model_version: str
-    detection_confidence: float
-    signature: Optional[str] = None
     timestamp: str
-    logged_by: str
-
+    detection_confidence: float
+    model_version: str
+    logged_by_msp: str
+    block_number: Optional[int] = None
+    signature: Optional[str] = None
 
 class AuditTrailRequest(BaseModel):
     asset_id: str
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
-    limit: int = Field(default=100, ge=1, le=1000)
-
+    page_size: int = Field(default=50, ge=1, le=500)
 
 class SeverityQueryRequest(BaseModel):
     severity: str
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
-    limit: int = Field(default=100, ge=1, le=1000)
+    page_size: int = Field(default=50, ge=1, le=500)
 
+class ComplianceReportRequest(BaseModel):
+    standard: ComplianceStandard
+    start_time: datetime
+    end_time: datetime
+    asset_ids: Optional[List[str]] = None
+    output_format: str = Field(default="json", regex="^(json|csv|pdf)$")
+
+class IntegrityCheckRequest(BaseModel):
+    event_id: str
 
 class IntegrityCheckResult(BaseModel):
     event_id: str
-    status: str  # "VALID" | "TAMPERED" | "MISSING_IPFS"
-    on_chain_sha256: str
-    computed_sha256: Optional[str] = None
-    match: Optional[bool] = None
-    checked_at: datetime
-
+    chain_sha256: str
+    ipfs_sha256: str
+    match: bool
+    ipfs_cid: str
+    verified_at: datetime
 
 class ComplianceReport(BaseModel):
-    framework: str
+    standard: str
     generated_at: datetime
     period_start: datetime
     period_end: datetime
     total_events: int
-    by_severity: Dict[str, int]
-    by_category: Dict[str, int]
-    by_asset: Dict[str, int]
-    integrity_pass_rate: float
-    events: List[AuditEventRecord]
-    report_path: Optional[str] = None
-
-
-class HealthResponse(BaseModel):
-    status: str
-    fabric_connected: bool
-    version: str = "1.0.0"
+    events_by_severity: Dict[str, int]
+    events_by_category: Dict[str, int]
+    high_confidence_events: int
+    integrity_violations: int
+    events: List[EventRecord]
+    report_sha256: str

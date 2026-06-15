@@ -1,77 +1,96 @@
 """Compliance report generation service."""
 import csv
+import hashlib
+import io
 import json
 import logging
-import os
-from collections import defaultdict
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import List, Optional
+
+import requests
 
 from config import config
-from schemas import AuditEventRecord, ComplianceReport, ComplianceFramework
+from query_service import query_service
+from schemas import ComplianceReport, ComplianceStandard, EventRecord
 
 logger = logging.getLogger(__name__)
 
 
 class ReportService:
-    def __init__(self):
-        self.output_dir = Path(config.report_output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-    def generate(
+    def generate_report(
         self,
-        framework: ComplianceFramework,
-        events: List[AuditEventRecord],
-        period_start: datetime,
-        period_end: datetime,
+        standard: ComplianceStandard,
+        start_time: datetime,
+        end_time: datetime,
+        asset_ids: Optional[List[str]] = None,
     ) -> ComplianceReport:
-        by_severity: dict = defaultdict(int)
-        by_category: dict = defaultdict(int)
-        by_asset: dict = defaultdict(int)
+        """Generate a compliance report for the given standard and time window."""
+        events: List[EventRecord] = []
 
-        for e in events:
-            by_severity[e.severity] += 1
-            by_category[e.attack_category] += 1
-            by_asset[e.asset_id] += 1
+        if asset_ids:
+            for asset_id in asset_ids:
+                events += query_service.query_audit_trail(
+                    asset_id=asset_id, start_time=start_time, end_time=end_time,
+                    page_size=config.max_query_results,
+                )
+        else:
+            for severity in ["LOW", "MEDIUM", "HIGH", "CRITICAL"]:
+                events += query_service.query_by_severity(
+                    severity=severity, start_time=start_time, end_time=end_time,
+                    page_size=config.max_query_results,
+                )
+
+        severity_counts = dict(Counter(e.severity for e in events))
+        category_counts = dict(Counter(e.attack_category for e in events))
+        high_conf = sum(1 for e in events if e.detection_confidence >= 0.9)
+
+        report_dict = {
+            "standard": standard.value,
+            "generated_at": datetime.utcnow().isoformat(),
+            "period_start": start_time.isoformat(),
+            "period_end": end_time.isoformat(),
+            "total_events": len(events),
+            "events_by_severity": severity_counts,
+            "events_by_category": category_counts,
+            "high_confidence_events": high_conf,
+            "integrity_violations": 0,
+            "events": [e.dict() for e in events],
+        }
+        sha256 = hashlib.sha256(
+            json.dumps(report_dict, sort_keys=True, default=str).encode()
+        ).hexdigest()
 
         report = ComplianceReport(
-            framework=framework.value,
-            generated_at=datetime.utcnow(),
-            period_start=period_start,
-            period_end=period_end,
-            total_events=len(events),
-            by_severity=dict(by_severity),
-            by_category=dict(by_category),
-            by_asset=dict(by_asset),
-            integrity_pass_rate=1.0,
+            **{k: v for k, v in report_dict.items() if k != "events"},
             events=events,
+            report_sha256=sha256,
+            generated_at=datetime.utcnow(),
+            period_start=start_time,
+            period_end=end_time,
         )
 
-        report_path = self._save_report(report, framework)
-        report.report_path = str(report_path)
-        logger.info("Generated %s report: %s events -> %s",
-                    framework.value, len(events), report_path)
+        self._save_report(report, standard)
         return report
 
-    def _save_report(self, report: ComplianceReport, framework: ComplianceFramework) -> Path:
-        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-        stem = f"{framework.value}_{ts}"
-
-        json_path = self.output_dir / f"{stem}.json"
-        with json_path.open("w") as f:
+    def _save_report(self, report: ComplianceReport, standard: ComplianceStandard):
+        output_dir = Path(config.reports_output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        filename = output_dir / f"{standard.value}_{report.generated_at.strftime('%Y%m%d_%H%M%S')}.json"
+        with filename.open("w") as f:
             json.dump(report.dict(), f, indent=2, default=str)
+        logger.info("Saved compliance report to %s", filename)
 
-        csv_path = self.output_dir / f"{stem}.csv"
-        if report.events:
-            keys = report.events[0].dict().keys()
-            with csv_path.open("w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=keys)
-                writer.writeheader()
-                for e in report.events:
-                    writer.writerow(e.dict())
-
-        return json_path
+    def export_csv(self, events: List[EventRecord]) -> str:
+        buf = io.StringIO()
+        if not events:
+            return ""
+        writer = csv.DictWriter(buf, fieldnames=events[0].dict().keys())
+        writer.writeheader()
+        for e in events:
+            writer.writerow(e.dict())
+        return buf.getvalue()
 
 
 report_service = ReportService()
