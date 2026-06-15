@@ -45,7 +45,9 @@ def hdr(msg):  print(f"\n{BOLD}{CYAN}{SEP}\n  {msg}\n{SEP}{RESET}")
 RESULTS_FILE = Path("results/run_results.json")
 RESULTS_FILE.parent.mkdir(exist_ok=True)
 
-VENV_DIR = Path(".venv")
+# Always resolve VENV_DIR to an absolute path so Popen works from any cwd
+VENV_DIR = Path(__file__).parent.resolve() / ".venv"
+
 
 # Fabric hostnames that must resolve to 127.0.0.1 for TLS SAN to match
 FABRIC_HOSTS = [
@@ -57,55 +59,68 @@ FABRIC_HOSTS = [
 
 
 # ============================================================
-def _venv_python_path() -> str:
-    """Return the python executable path inside the venv, handling Linux/macOS/Windows."""
-    # On Linux/macOS the venv may create 'python3' but not 'python'
-    for name in ("python", "python3"):
+def _venv_python_path() -> Path:
+    """Return the python executable Path inside the venv (absolute)."""
+    for name in ("python3", "python"):
         candidate = VENV_DIR / "bin" / name
         if candidate.exists():
-            return str(candidate)
+            return candidate
     # Windows fallback
     win = VENV_DIR / "Scripts" / "python.exe"
     if win.exists():
-        return str(win)
-    # Not found yet — return the expected path so the caller raises a clear error
-    return str(VENV_DIR / "bin" / "python3")
+        return win
+    # Return expected path; caller will recreate venv if missing
+    return VENV_DIR / "bin" / "python3"
 
 
-def _venv_pip_path() -> str:
-    for name in ("pip", "pip3"):
+def _venv_pip_path() -> Path:
+    for name in ("pip3", "pip"):
         candidate = VENV_DIR / "bin" / name
         if candidate.exists():
-            return str(candidate)
+            return candidate
     win = VENV_DIR / "Scripts" / "pip.exe"
     if win.exists():
-        return str(win)
-    return str(VENV_DIR / "bin" / "pip3")
+        return win
+    return VENV_DIR / "bin" / "pip3"
+
+
+def _make_venv():
+    """Nuke any broken .venv and create a fresh one."""
+    if VENV_DIR.exists():
+        shutil.rmtree(str(VENV_DIR))
+    info(f"Creating venv at {VENV_DIR} ...")
+    subprocess.check_call([sys.executable, "-m", "venv", str(VENV_DIR)])
+    ok(".venv created")
 
 
 def ensure_venv():
-    """Create .venv if absent; install all service requirements; return (python, pip) paths."""
+    """Guarantee a working venv; install all service requirements; return (python, pip) paths."""
+    # Recreate if the python binary is missing
+    if not _venv_python_path().exists():
+        _make_venv()
+
     venv_python = _venv_python_path()
     venv_pip    = _venv_pip_path()
 
-    if not Path(venv_python).exists():
-        info("Creating .venv for service dependencies ...")
-        subprocess.check_call([sys.executable, "-m", "venv", str(VENV_DIR)])
-        venv_python = _venv_python_path()
-        venv_pip    = _venv_pip_path()
-        ok(".venv created")
+    # Sanity-check after possible re-creation
+    if not venv_python.exists():
+        raise RuntimeError(
+            f"venv python not found at {venv_python} even after recreation.\n"
+            f"Run manually:  rm -rf {VENV_DIR} && python3 -m venv {VENV_DIR}"
+        )
 
-    subprocess.call([venv_pip, "install", "--upgrade", "pip", "-q"])
+    subprocess.call([str(venv_pip), "install", "--upgrade", "pip", "-q"])
 
-    for req in Path("services").rglob("requirements.txt"):
+    for req in sorted(Path("services").rglob("requirements.txt")):
         info(f"Installing {req} into .venv ...")
-        result = subprocess.call([venv_pip, "install", "-r", str(req), "-q"])
+        result = subprocess.call([str(venv_pip), "install", "-r", str(req), "-q"])
         if result == 0:
             ok(f"  {req} — done")
         else:
             warn(f"  {req} — some packages failed (check manually)")
 
-    return venv_python, venv_pip
+    ok(f"Using venv python: {venv_python}")
+    return str(venv_python), str(venv_pip)
 
 
 # ============================================================
@@ -391,6 +406,36 @@ metrics:
 
 
 # ============================================================
+# helpers — orderer TLS CA path probe
+# ============================================================
+
+def _find_orderer_tls_ca() -> str:
+    """
+    cryptogen can place the orderer TLS CA cert in two different locations
+    depending on Fabric version. Try both and return whichever exists.
+    Falls back to the msp/tlscacerts path (most common).
+    """
+    base = Path("crypto-config/ordererOrganizations/example.com")
+    candidates = [
+        # Fabric 2.x standard — under the orderer's own msp
+        base / "orderers/orderer.example.com/msp/tlscacerts/tlsca.example.com-cert.pem",
+        # Alternative location used by some cryptogen versions
+        base / "tlsca/tlsca.example.com-cert.pem",
+        # Orderer TLS server cert (last resort)
+        base / "orderers/orderer.example.com/tls/ca.crt",
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c.resolve())
+
+    # None found — return the most standard path so the error message is helpful
+    warn("Orderer TLS CA cert not found in any expected location:")
+    for c in candidates:
+        warn(f"  {c}")
+    return str(candidates[0].resolve())
+
+
+# ============================================================
 # helpers — idempotent chaincode lifecycle checks
 # ============================================================
 
@@ -571,10 +616,10 @@ def setup_channel_and_chaincode():
         Path("crypto-config/peerOrganizations/org1.example.com"
              "/peers/peer0.org1.example.com/tls/ca.crt").resolve()
     )
-    orderer_tls = str(
-        Path("crypto-config/ordererOrganizations/example.com"
-             "/tlsca/tlsca.example.com-cert.pem").resolve()
-    )
+
+    # Probe for the correct orderer TLS CA path (varies by Fabric/cryptogen version)
+    orderer_tls = _find_orderer_tls_ca()
+    info(f"Orderer TLS CA: {orderer_tls}")
 
     base_env = {
         **os.environ,
@@ -690,7 +735,7 @@ def setup_channel_and_chaincode():
         if rc == 0:
             ok("Chaincode approved")
         else:
-            warn(f"approveformyorg exited {rc} — may already be approved")
+            warn(f"approveformyorg exited {rc} — check orderer TLS CA path above")
 
     # ── Commit ────────────────────────────────────────────
     info("Committing chaincode ...")
@@ -729,19 +774,7 @@ def wait_for_port(port: int, timeout: int = 45) -> bool:
 
 def start_services():
     hdr("Step 5 — Start Python Microservices")
-    venv_python, _venv_pip = ensure_venv()
-
-    if not Path(venv_python).exists():
-        warn(f"venv python not found at {venv_python}")
-        warn("Recreating .venv ...")
-        shutil.rmtree(str(VENV_DIR), ignore_errors=True)
-        subprocess.check_call([sys.executable, "-m", "venv", str(VENV_DIR)])
-        venv_python = _venv_python_path()
-        _venv_pip_new = _venv_pip_path()
-        for req in Path("services").rglob("requirements.txt"):
-            subprocess.call([_venv_pip_new, "install", "-r", str(req), "-q"])
-
-    ok(f"Using venv python: {venv_python}")
+    venv_python, _ = ensure_venv()
 
     services = [
         ("detector-adapter",  "services/detector-adapter/app.py",  8000),
@@ -751,13 +784,14 @@ def start_services():
 
     procs = []
     for name, script, port in services:
-        if not Path(script).exists():
+        script_path = Path(script)
+        if not script_path.exists():
             warn(f"{script} not found — skipping")
             continue
         log_path = Path(f"results/{name}.log")
         log_path.parent.mkdir(exist_ok=True)
-        log_fh = open(log_path, "w")
-        svc_dir = str(Path(script).parent.resolve())
+        log_fh   = open(log_path, "w")
+        svc_dir  = str(script_path.parent.resolve())
         p = subprocess.Popen(
             [venv_python, "app.py"],
             cwd=svc_dir,
