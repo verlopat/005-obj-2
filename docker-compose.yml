@@ -26,6 +26,8 @@ services:
       - "29092:29092"    # Kafka API (internal)
       - "8082:8082"      # Pandaproxy HTTP
       - "9644:9644"      # Admin API
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
     healthcheck:
       test: ["CMD", "rpk", "cluster", "info", "--brokers=localhost:9092"]
       interval: 10s
@@ -66,6 +68,9 @@ services:
 
   # ─────────────────────────────────────────────────────────────
   # Orderer (Raft)
+  # Persistent volume ensures the orderer retains its channel
+  # ledger across `docker compose down / up` restarts, preventing
+  # the NOT_FOUND error on approveformyorg re-runs.
   # ─────────────────────────────────────────────────────────────
   orderer.example.com:
     image: hyperledger/fabric-orderer:2.5
@@ -90,6 +95,7 @@ services:
       - ./channel-artifacts/genesis.block:/var/hyperledger/orderer/orderer.genesis.block
       - ./crypto-config/ordererOrganizations/example.com/orderers/orderer.example.com/msp:/var/hyperledger/orderer/msp
       - ./crypto-config/ordererOrganizations/example.com/orderers/orderer.example.com/tls/:/var/hyperledger/orderer/tls
+      - orderer-data:/var/hyperledger/production/orderer
     ports:
       - "7050:7050"
     networks:
@@ -105,6 +111,8 @@ services:
       - COUCHDB_PASSWORD=adminpw
     ports:
       - "5984:5984"
+    volumes:
+      - couchdb0-data:/opt/couchdb/data
     networks:
       - fabric-network
 
@@ -115,6 +123,8 @@ services:
       - COUCHDB_PASSWORD=adminpw
     ports:
       - "6984:5984"
+    volumes:
+      - couchdb1-data:/opt/couchdb/data
     networks:
       - fabric-network
 
@@ -152,6 +162,7 @@ services:
       - /var/run/:/host/var/run/
       - ./crypto-config/peerOrganizations/org1.example.com/peers/peer0.org1.example.com/msp:/etc/hyperledger/fabric/msp
       - ./crypto-config/peerOrganizations/org1.example.com/peers/peer0.org1.example.com/tls:/etc/hyperledger/fabric/tls
+      - peer0-data:/var/hyperledger/production
     ports:
       - "7051:7051"
     depends_on:
@@ -196,6 +207,7 @@ services:
       - /var/run/:/host/var/run/
       - ./crypto-config/peerOrganizations/org1.example.com/peers/peer1.org1.example.com/msp:/etc/hyperledger/fabric/msp
       - ./crypto-config/peerOrganizations/org1.example.com/peers/peer1.org1.example.com/tls:/etc/hyperledger/fabric/tls
+      - peer1-data:/var/hyperledger/production
     ports:
       - "8051:8051"
     depends_on:
@@ -220,7 +232,13 @@ services:
       - fabric-network
 
 volumes:
+  orderer-data:       # orderer ledger — survives docker compose down/up
+  peer0-data:         # peer0 chaincode lifecycle + ledger state
+  peer1-data:         # peer1 chaincode lifecycle + ledger state
+  couchdb0-data:      # peer0 world state (CouchDB)
+  couchdb1-data:      # peer1 world state (CouchDB)
   ipfs-data:
+  redpanda-data:      # Kafka topic data
 
 networks:
   fabric-network:
