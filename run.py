@@ -47,6 +47,267 @@ RESULTS_FILE = Path("results/run_results.json")
 RESULTS_FILE.parent.mkdir(exist_ok=True)
 
 # ════════════════════════════════════════════════════════════════════════════
+# FABRIC_CFG_PATH auto-detection
+# The 'peer' binary requires core.yaml. It ships in fabric-samples/config/.
+# We search common locations and fall back to writing a minimal core.yaml.
+# ════════════════════════════════════════════════════════════════════════════
+
+def find_fabric_cfg_path() -> str:
+    """Return the directory containing core.yaml for the peer binary."""
+    candidates = [
+        # Same repo: curl script drops fabric-samples next to us
+        Path(__file__).parent / "fabric-samples" / "config",
+        # Home directory (common install target)
+        Path.home() / "fabric-samples" / "config",
+        Path.home() / "go" / "src" / "github.com" / "hyperledger" / "fabric-samples" / "config",
+        # Already set in environment
+        Path(os.environ.get("FABRIC_CFG_PATH", "")),
+    ]
+    for c in candidates:
+        if c and (c / "core.yaml").exists():
+            return str(c)
+
+    # Last resort: write a minimal core.yaml into ./fabric-config/
+    cfg_dir = Path(__file__).parent / "fabric-config"
+    cfg_dir.mkdir(exist_ok=True)
+    core_yaml = cfg_dir / "core.yaml"
+    if not core_yaml.exists():
+        info("Writing minimal core.yaml into ./fabric-config/ …")
+        core_yaml.write_text("""\
+peer:
+  id: peer0.org1.example.com
+  networkId: dev
+  listenAddress: 0.0.0.0:7051
+  address: 0.0.0.0:7051
+  addressAutoDetect: false
+  gateway:
+    enabled: true
+    endorsementTimeout: 30s
+    broadcastTimeout: 30s
+  keepalive:
+    interval: 7200s
+    timeout: 20s
+    client:
+      interval: 60s
+      timeout: 20s
+    deliveryClient:
+      interval: 60s
+      timeout: 20s
+  gossip:
+    bootstrap: 127.0.0.1:7051
+    useLeaderElection: true
+    orgLeader: false
+    endpoint:
+    maxBlockCountToStore: 100
+    maxPropagationBurstLatency: 10ms
+    maxPropagationBurstSize: 10
+    propagateIterations: 1
+    propagatePeerNum: 3
+    pullInterval: 4s
+    pullPeerNum: 3
+    requestStateInfoInterval: 4s
+    publishStateInfoInterval: 4s
+    stateInfoRetentionInterval:
+    publishCertPeriod: 10s
+    skipBlockVerification: false
+    dialTimeout: 3s
+    connTimeout: 2s
+    recvBuffSize: 20
+    sendBuffSize: 200
+    digestWaitTime: 1s
+    requestWaitTime: 1500ms
+    responseWaitTime: 2s
+    aliveTimeInterval: 5s
+    aliveExpirationTimeout: 25s
+    reconnectInterval: 25s
+    externalEndpoint:
+    election:
+      startupGracePeriod: 15s
+      membershipSampleInterval: 1s
+      leaderAliveThreshold: 10s
+      leaderElectionDuration: 5s
+    pvtData:
+      pullRetryThreshold: 60s
+      transientstoreMaxBlockRetention: 1000
+      pushAckTimeout: 3s
+      btlPullMargin: 10
+      reconcileBatchSize: 10
+      reconcileSleepInterval: 1m
+      reconciliationEnabled: true
+      skipPullingInvalidTransactionsDuringCommit: false
+    state:
+      enabled: false
+  tls:
+    enabled: true
+    clientAuthRequired: false
+    cert:
+      file: tls/server.crt
+    key:
+      file: tls/server.key
+    rootcert:
+      file: tls/ca.crt
+    clientRootCAs:
+      files:
+        - tls/ca.crt
+    clientKey:
+      file:
+    clientCert:
+      file:
+  authentication:
+    timewindow: 15m
+  fileSystemPath: /var/hyperledger/production
+  BCCSP:
+    Default: SW
+    SW:
+      Hash: SHA2
+      Security: 256
+      FileKeyStore:
+        KeyStore:
+    PKCS11:
+      Library:
+      Label:
+      Pin:
+      Hash:
+      Security:
+  mspConfigPath: msp
+  localMspId: Org1MSP
+  client:
+    connTimeout: 3s
+  deliveryclient:
+    reconnectTotalTimeThreshold: 3600s
+    connTimeout: 3s
+    reConnectBackoffThreshold: 3600s
+    addressOverrides:
+  localMspType: bccsp
+  profile:
+    enabled: false
+    listenAddress: 0.0.0.0:6060
+  adminService:
+    listenAddress: 0.0.0.0:9443
+  handlers:
+    authFilters:
+      - name: DefaultAuth
+      - name: ExpirationCheck
+    decorators:
+      - name: DefaultDecorator
+    endorsers:
+      escc:
+        name: DefaultEndorsement
+        library:
+    validators:
+      vscc:
+        name: DefaultValidation
+        library:
+  validatorPoolSize:
+  discovery:
+    enabled: true
+    authCacheEnabled: true
+    authCacheMaxSize: 1000
+    authCachePurgeRetentionRatio: 0.75
+    orgMembersAllowedAccess: false
+  limits:
+    concurrency:
+      endorserService: 2500
+      deliverService: 2500
+
+vm:
+  endpoint: unix:///var/run/docker.sock
+  docker:
+    tls:
+      enabled: false
+      ca:
+        file: docker/ca.crt
+      cert:
+        file: docker/tls.crt
+      key:
+        file: docker/tls.key
+    attachStdout: false
+    hostConfig:
+      NetworkMode: host
+      LogConfig:
+        Type: json-file
+        Config:
+          max-size: "50m"
+          max-file: "5"
+      Memory: 2147483648
+
+chaincode:
+  id:
+    path:
+    name:
+  builder: $(DOCKER_NS)/fabric-ccenv:$(TWO_DIGIT_VERSION)
+  pull: false
+  golang:
+    runtime: $(DOCKER_NS)/fabric-baseos:$(TWO_DIGIT_VERSION)
+    dynamicLink: false
+  java:
+    runtime: $(DOCKER_NS)/fabric-javaenv:$(TWO_DIGIT_VERSION)
+  node:
+    runtime: $(DOCKER_NS)/fabric-nodeenv:$(TWO_DIGIT_VERSION)
+  externalBuilders: []
+  installTimeout: 300s
+  startuptimeout: 300s
+  executetimeout: 30s
+  mode: net
+  keepalive: 0
+  system:
+    _lifecycle: enable
+    cscc: enable
+    lscc: enable
+    qscc: enable
+  logging:
+    level: info
+    shim: warning
+    format: '%{color}%{time:2006-01-02 15:04:05.000 MST} [%{module}] %{shortfunc} -> %{level:.4s} %{id:03x}%{color:reset} %{message}'
+
+ledger:
+  blockchain:
+  state:
+    stateDatabase: CouchDB
+    totalQueryLimit: 100000
+    couchDBConfig:
+      couchDBAddress: 127.0.0.1:5984
+      username:
+      password:
+      maxRetries: 3
+      maxRetriesOnStartup: 12
+      requestTimeout: 35s
+      internalQueryLimit: 1000
+      maxBatchUpdateSize: 1000
+      warmIndexesAfterNBlocks: 1
+      createGlobalChangesDB: false
+      cacheSize: 64
+  history:
+    enableHistoryDatabase: true
+  pvtdataStore:
+    collElgProcMaxDbBatchSize: 5000
+    collElgProcDbBatchesInterval: 1000
+    deprioritizedDataReconcilerInterval: 60m
+
+operations:
+  listenAddress: 127.0.0.1:9443
+  tls:
+    enabled: false
+    cert:
+      file:
+    key:
+      file:
+    clientAuthRequired: false
+    clientRootCAs:
+      files: []
+
+metrics:
+  provider: disabled
+  statsd:
+    network: udp
+    address: 127.0.0.1:8125
+    writeInterval: 10s
+    prefix:
+""")
+    return str(cfg_dir)
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # 1. PREREQUISITE CHECKS
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -80,6 +341,10 @@ def check_prereqs(mock: bool) -> bool:
                      "run: curl -sSL https://bit.ly/2ysbOFE | bash -s -- 2.5.0 1.5.0")
                 all_ok = False
 
+        # Detect and report FABRIC_CFG_PATH
+        cfg = find_fabric_cfg_path()
+        ok(f"FABRIC_CFG_PATH: {cfg}")
+
     # Python packages
     required = ["requests", "cryptography"]
     for pkg in required:
@@ -103,7 +368,7 @@ def generate_crypto_and_genesis():
 
     crypto_cfg = Path("crypto-config.yaml")
     if not crypto_cfg.exists():
-        crypto_cfg.write_text("""
+        crypto_cfg.write_text("""\
 OrdererOrgs:
   - Name: Orderer
     Domain: example.com
@@ -191,23 +456,27 @@ def teardown_docker_stack():
 def setup_channel_and_chaincode():
     hdr("Step 4 — Create Channel & Deploy Chaincode")
 
+    fabric_cfg = find_fabric_cfg_path()
+    info(f"Using FABRIC_CFG_PATH={fabric_cfg}")
+
     base_env = {
         **os.environ,
+        "FABRIC_CFG_PATH": fabric_cfg,
         "CORE_PEER_TLS_ENABLED": "true",
         "CORE_PEER_LOCALMSPID": "Org1MSP",
         "CORE_PEER_ADDRESS": "localhost:7051",
-        "CORE_PEER_MSPCONFIGPATH": (
-            "crypto-config/peerOrganizations/org1.example.com"
-            "/users/Admin@org1.example.com/msp"
+        "CORE_PEER_MSPCONFIGPATH": str(
+            Path("crypto-config/peerOrganizations/org1.example.com"
+                 "/users/Admin@org1.example.com/msp").resolve()
         ),
-        "CORE_PEER_TLS_ROOTCERT_FILE": (
-            "crypto-config/peerOrganizations/org1.example.com"
-            "/peers/peer0.org1.example.com/tls/ca.crt"
+        "CORE_PEER_TLS_ROOTCERT_FILE": str(
+            Path("crypto-config/peerOrganizations/org1.example.com"
+                 "/peers/peer0.org1.example.com/tls/ca.crt").resolve()
         ),
     }
-    orderer_tls = (
-        "crypto-config/ordererOrganizations/example.com"
-        "/tlsca/tlsca.example.com-cert.pem"
+    orderer_tls = str(
+        Path("crypto-config/ordererOrganizations/example.com"
+             "/tlsca/tlsca.example.com-cert.pem").resolve()
     )
 
     block = Path("channel-artifacts/security-channel.block")
@@ -217,15 +486,17 @@ def setup_channel_and_chaincode():
             "peer", "channel", "create",
             "-o", "localhost:7050",
             "-c", "security-channel",
-            "-f", "channel-artifacts/security-channel.tx",
-            "--outputBlock", str(block),
+            "-f", str(Path("channel-artifacts/security-channel.tx").resolve()),
+            "--outputBlock", str(block.resolve()),
             "--tls", "--cafile", orderer_tls,
         ], env=base_env)
         ok("Channel created")
+    else:
+        ok("security-channel.block already exists — skipping create")
 
     info("Joining peer0 to channel …")
     subprocess.call(
-        ["peer", "channel", "join", "-b", str(block)],
+        ["peer", "channel", "join", "-b", str(block.resolve())],
         env=base_env
     )
     ok("peer0 joined channel")
@@ -235,7 +506,7 @@ def setup_channel_and_chaincode():
     subprocess.call([
         "peer", "lifecycle", "chaincode", "package",
         "security_logger.tar.gz",
-        "--path", "./chaincode",
+        "--path", str(Path("chaincode").resolve()),
         "--lang", "golang",
         "--label", "security_logger_1.0",
     ], env=base_env)
