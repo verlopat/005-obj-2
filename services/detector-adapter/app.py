@@ -1,4 +1,4 @@
-"""Detector Adapter - FastAPI ingestion endpoint that publishes events to Kafka."""
+"""Detector Adapter — FastAPI ingestion endpoint that publishes events to Kafka."""
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -11,18 +11,20 @@ from prometheus_client import Counter, Histogram, make_asgi_app
 from config import config
 from producer import producer
 from schemas import (
-    BatchEventRequest, BatchEventResponse,
-    EventResponse, HealthResponse, SecurityEventRequest,
+    BatchEventRequest, BatchEventResponse, EventResponse,
+    HealthResponse, SecurityEventRequest,
 )
 
-logging.basicConfig(level=getattr(logging, config.log_level),
-                    format="%(asctime)s %(name)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=getattr(logging, config.log_level),
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+)
 logger = logging.getLogger(__name__)
 
-EVENTS_PRODUCED = Counter("detector_events_produced_total", "Total events produced to Kafka", ["severity"])
-EVENTS_FAILED = Counter("detector_events_failed_total", "Total events that failed to produce")
-INGESTION_LATENCY = Histogram("detector_ingestion_latency_seconds", "Ingestion latency",
-                               buckets=[.001, .005, .01, .05, .1, .5, 1])
+EVENTS_PRODUCED = Counter("detector_events_produced_total", "Events produced to Kafka", ["severity"])
+EVENTS_FAILED  = Counter("detector_events_failed_total",   "Events failed to produce")
+INGEST_LATENCY = Histogram("detector_ingestion_latency_seconds", "Ingestion latency",
+                            buckets=[.001, .005, .01, .05, .1, .5, 1])
 
 
 @asynccontextmanager
@@ -34,10 +36,12 @@ async def lifespan(app: FastAPI):
     producer.close()
 
 
-app = FastAPI(title="Security Event Detector Adapter",
-              description="Ingests anomaly detection events and publishes them to Kafka",
-              version="1.0.0", lifespan=lifespan)
-
+app = FastAPI(
+    title="Security Event Detector Adapter",
+    description="Ingests anomaly detection events and publishes them to Kafka",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["POST", "GET"], allow_headers=["*"])
 app.mount("/metrics", make_asgi_app())
 
@@ -54,7 +58,7 @@ async def ingest_event(event: SecurityEventRequest):
     try:
         producer.produce(str(event.event_id), event.dict())
         EVENTS_PRODUCED.labels(severity=event.severity.value).inc()
-        INGESTION_LATENCY.observe(time.perf_counter() - start)
+        INGEST_LATENCY.observe(time.perf_counter() - start)
         return EventResponse(event_id=str(event.event_id), status="accepted")
     except Exception as exc:
         EVENTS_FAILED.inc()

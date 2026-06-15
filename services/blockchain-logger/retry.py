@@ -1,4 +1,4 @@
-"""Exponential backoff retry decorator with jitter."""
+"""Exponential backoff retry decorator with full jitter."""
 import functools
 import logging
 import random
@@ -15,7 +15,7 @@ def exponential_backoff(
     exceptions: Tuple[Type[Exception], ...] = (Exception,),
     on_retry: Optional[Callable] = None,
 ):
-    """Decorator: retry with exponential backoff + full jitter."""
+    """Retry with exponential backoff + full jitter on the specified exceptions."""
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
@@ -28,9 +28,9 @@ def exponential_backoff(
                     if attempt == max_retries:
                         logger.error("%s failed after %d attempts: %s", func.__name__, max_retries, exc)
                         raise
-                    delay = min(base_delay * (2 ** attempt), max_delay)
-                    jitter = random.uniform(0, delay)
-                    logger.warning("%s attempt %d/%d failed: %s - retrying in %.2fs",
+                    cap = min(base_delay * (2 ** attempt), max_delay)
+                    jitter = random.uniform(0, cap)
+                    logger.warning("%s attempt %d/%d failed: %s — retrying in %.2fs",
                                    func.__name__, attempt + 1, max_retries, exc, jitter)
                     if on_retry:
                         on_retry(attempt, exc)

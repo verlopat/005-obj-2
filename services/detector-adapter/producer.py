@@ -1,4 +1,4 @@
-"""Kafka producer with idempotency, retries, and delivery callbacks."""
+"""Kafka producer with idempotency, retries, and DLQ fallback."""
 import json
 import logging
 import threading
@@ -41,8 +41,10 @@ class SecurityEventProducer:
         if err:
             logger.error("Delivery failed for event %s: %s", msg.key(), err)
         else:
-            logger.debug("Event %s delivered to %s [%d] offset %d",
-                         msg.key(), msg.topic(), msg.partition(), msg.offset())
+            logger.debug(
+                "Event %s delivered to %s [%d] offset %d",
+                msg.key(), msg.topic(), msg.partition(), msg.offset(),
+            )
 
     def produce(self, event_id: str, payload: dict, on_delivery: Optional[Callable] = None) -> None:
         producer = self._get_producer()
