@@ -14,6 +14,7 @@ Usage:
 import argparse
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -37,15 +38,23 @@ def ok(msg):   print(f"{GREEN}  ✔  {msg}{RESET}")
 def warn(msg): print(f"{YELLOW}  ⚠  {msg}{RESET}")
 def err(msg):  print(f"{RED}  ✘  {msg}{RESET}")
 def info(msg): print(f"{CYAN}  ▶  {msg}{RESET}")
-def hdr(msg):  print(f"\n{BOLD}{CYAN}{'─'*60}\n  {msg}\n{'─'*60}{RESET}")
+def hdr(msg):  print(f"\n{BOLD}{CYAN}{────────────────────────────────────────────────────────────}\n  {msg}\n{────────────────────────────────────────────────────────────}{RESET}")
 
 RESULTS_FILE = Path("results/run_results.json")
 RESULTS_FILE.parent.mkdir(exist_ok=True)
 
-# Virtualenv path — avoids Arch "externally-managed-environment" error
 VENV_DIR = Path(".venv")
 
+# Fabric hostnames that must resolve to 127.0.0.1 for TLS SAN to match
+FABRIC_HOSTS = [
+    "peer0.org1.example.com",
+    "peer1.org1.example.com",
+    "orderer.example.com",
+    "ca.org1.example.com",
+]
 
+
+# ════════════════════════════════════════════════════════════════════════════
 def ensure_venv():
     """Create .venv if absent; install all service requirements; return (python, pip) paths."""
     venv_python = str(VENV_DIR / "bin" / "python")
@@ -56,10 +65,8 @@ def ensure_venv():
         subprocess.check_call([sys.executable, "-m", "venv", str(VENV_DIR)])
         ok(".venv created")
 
-    # Upgrade pip silently
     subprocess.call([venv_pip, "install", "--upgrade", "pip", "-q"])
 
-    # Install ALL service requirements up-front so services launch cleanly
     for req in Path("services").rglob("requirements.txt"):
         info(f"Installing {req} into .venv ...")
         result = subprocess.call([venv_pip, "install", "-r", str(req), "-q"])
@@ -69,6 +76,63 @@ def ensure_venv():
             warn(f"  {req} — some packages failed (check manually)")
 
     return venv_python, venv_pip
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# /etc/hosts injection — ensures Fabric hostnames resolve to 127.0.0.1
+# so that TLS SANs match when the peer CLI connects via the Docker-published port.
+# ════════════════════════════════════════════════════════════════════════════
+
+def _hosts_already_patched() -> bool:
+    try:
+        content = Path("/etc/hosts").read_text()
+        return "peer0.org1.example.com" in content
+    except Exception:
+        return True  # can’t read — assume ok, skip
+
+
+def inject_etc_hosts():
+    """Add Fabric hostname → 127.0.0.1 entries to /etc/hosts if not already present.
+    Requires sudo; skips gracefully if not root and sudo is unavailable.
+    """
+    if platform.system() != "Linux":
+        return  # /etc/hosts injection only needed on Linux (macOS Docker uses host.docker.internal)
+
+    if _hosts_already_patched():
+        ok("Fabric hostnames already in /etc/hosts")
+        return
+
+    entries = "\n# Hyperledger Fabric local dev (added by run.py)\n"
+    for h in FABRIC_HOSTS:
+        entries += f"127.0.0.1  {h}\n"
+
+    # Try passwordless sudo first, then fall back to tee with sudo
+    try:
+        result = subprocess.run(
+            ["sudo", "tee", "-a", "/etc/hosts"],
+            input=entries,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            ok("Fabric hostnames injected into /etc/hosts")
+            return
+    except FileNotFoundError:
+        pass
+
+    # sudo not available — try direct write (works if running as root)
+    try:
+        with open("/etc/hosts", "a") as fh:
+            fh.write(entries)
+        ok("Fabric hostnames injected into /etc/hosts (direct write)")
+        return
+    except PermissionError:
+        pass
+
+    warn("Could not inject /etc/hosts (no sudo / not root).")
+    warn("Run manually ONCE before running this script:")
+    warn("  sudo bash -c 'echo \"127.0.0.1  peer0.org1.example.com orderer.example.com\" >> /etc/hosts'")
+    warn("Or run: python run.py --inject-hosts  (uses sudo)")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -86,7 +150,7 @@ def find_fabric_cfg_path() -> str:
         if c and (c / "core.yaml").exists():
             return str(c)
 
-    cfg_dir  = Path(__file__).parent / "fabric-config"
+    cfg_dir   = Path(__file__).parent / "fabric-config"
     cfg_dir.mkdir(exist_ok=True)
     core_yaml = cfg_dir / "core.yaml"
     if not core_yaml.exists():
@@ -181,12 +245,6 @@ peer:
       Security: 256
       FileKeyStore:
         KeyStore:
-    PKCS11:
-      Library:
-      Label:
-      Pin:
-      Hash:
-      Security:
   mspConfigPath: msp
   localMspId: Org1MSP
   client:
@@ -195,7 +253,6 @@ peer:
     reconnectTotalTimeThreshold: 3600s
     connTimeout: 3s
     reConnectBackoffThreshold: 3600s
-    addressOverrides:
   localMspType: bccsp
   profile:
     enabled: false
@@ -233,12 +290,6 @@ vm:
   docker:
     tls:
       enabled: false
-      ca:
-        file: docker/ca.crt
-      cert:
-        file: docker/tls.crt
-      key:
-        file: docker/tls.key
     attachStdout: false
     hostConfig:
       NetworkMode: host
@@ -258,11 +309,6 @@ chaincode:
   golang:
     runtime: $(DOCKER_NS)/fabric-baseos:$(TWO_DIGIT_VERSION)
     dynamicLink: false
-  java:
-    runtime: $(DOCKER_NS)/fabric-javaenv:$(TWO_DIGIT_VERSION)
-  node:
-    runtime: $(DOCKER_NS)/fabric-nodeenv:$(TWO_DIGIT_VERSION)
-  externalBuilders: []
   installTimeout: 300s
   startuptimeout: 300s
   executetimeout: 30s
@@ -316,11 +362,6 @@ operations:
 
 metrics:
   provider: disabled
-  statsd:
-    network: udp
-    address: 127.0.0.1:8125
-    writeInterval: 10s
-    prefix:
 """)
     return str(cfg_dir)
 
@@ -355,13 +396,11 @@ def check_prereqs(mock: bool) -> bool:
             if shutil.which(bin_):
                 ok(f"Fabric binary: {bin_}")
             else:
-                warn(f"Fabric binary '{bin_}' not in PATH — "
-                     "run: curl -sSL https://bit.ly/2ysbOFE | bash -s -- 2.5.0 1.5.0")
+                warn(f"Fabric binary '{bin_}' not in PATH")
                 all_ok = False
         cfg = find_fabric_cfg_path()
         ok(f"FABRIC_CFG_PATH: {cfg}")
 
-    # Check packages in current python (for run.py itself only)
     for pkg in ["requests", "cryptography"]:
         try:
             __import__(pkg)
@@ -449,7 +488,7 @@ def start_docker_stack():
         services = json.loads(f"[{result.replace(chr(10), ',')}]") if result else []
     except Exception:
         services = []
-    running = [s for s in services if isinstance(s, dict) and "running" in str(s.get("State","")).lower()]
+    running = [s for s in services if isinstance(s, dict) and "running" in str(s.get("State", "")).lower()]
     ok(f"{len(running)}/{len(services) or '?'} containers running")
 
 
@@ -466,12 +505,15 @@ def teardown_docker_stack():
 def setup_channel_and_chaincode():
     hdr("Step 4 — Create Channel & Deploy Chaincode")
 
+    # ── TLS FIX: ensure peer hostnames resolve to 127.0.0.1 before ANY peer CLI call
+    inject_etc_hosts()
+
     fabric_cfg = find_fabric_cfg_path()
     info(f"Using FABRIC_CFG_PATH={fabric_cfg}")
 
-    ORDERER_ADDR     = "localhost:7050"
+    PEER_ADDR        = "peer0.org1.example.com:7051"  # matches cert SAN
+    ORDERER_ADDR     = "orderer.example.com:7050"     # matches cert SAN
     ORDERER_HOSTNAME = "orderer.example.com"
-    PEER_HOSTNAME    = "peer0.org1.example.com"   # must match cert SAN
 
     peer_tls_ca = str(
         Path("crypto-config/peerOrganizations/org1.example.com"
@@ -482,23 +524,20 @@ def setup_channel_and_chaincode():
              "/tlsca/tlsca.example.com-cert.pem").resolve()
     )
 
-    # ── FIX: CORE_PEER_TLS_HOSTNAME_OVERRIDE tells the TLS layer to expect
-    #         the peer's actual hostname when dialling localhost:7051.
     base_env = {
         **os.environ,
-        "FABRIC_CFG_PATH":                    fabric_cfg,
-        "CORE_PEER_TLS_ENABLED":              "true",
-        "CORE_PEER_LOCALMSPID":               "Org1MSP",
-        "CORE_PEER_ADDRESS":                  "localhost:7051",
-        "CORE_PEER_TLS_HOSTNAME_OVERRIDE":    PEER_HOSTNAME,
-        "CORE_PEER_MSPCONFIGPATH":            str(
+        "FABRIC_CFG_PATH":         fabric_cfg,
+        "CORE_PEER_TLS_ENABLED":   "true",
+        "CORE_PEER_LOCALMSPID":    "Org1MSP",
+        "CORE_PEER_ADDRESS":       PEER_ADDR,
+        "CORE_PEER_MSPCONFIGPATH": str(
             Path("crypto-config/peerOrganizations/org1.example.com"
                  "/users/Admin@org1.example.com/msp").resolve()
         ),
-        "CORE_PEER_TLS_ROOTCERT_FILE":        peer_tls_ca,
+        "CORE_PEER_TLS_ROOTCERT_FILE": peer_tls_ca,
     }
 
-    # ── channel create ────────────────────────────────────────────────────
+    # ── channel create
     block = Path("channel-artifacts/security-channel.block")
     if not block.exists():
         info("Creating channel ...")
@@ -515,44 +554,44 @@ def setup_channel_and_chaincode():
     else:
         ok("security-channel.block already exists — skipping create")
 
-    # ── peer join ─────────────────────────────────────────────────────────
+    # ── peer join
     info("Joining peer0 to channel ...")
     rc = subprocess.call(
         ["peer", "channel", "join", "-b", str(block.resolve())],
-        env=base_env
+        env=base_env,
     )
     if rc == 0:
         ok("peer0 joined channel")
     else:
         warn(f"peer channel join exited {rc} — peer may already be joined, continuing")
 
-    # ── chaincode package ─────────────────────────────────────────────────
+    # ── chaincode package
     info("Packaging chaincode ...")
     subprocess.call(["go", "mod", "tidy"], cwd="chaincode")
     subprocess.call([
         "peer", "lifecycle", "chaincode", "package",
         "security_logger.tar.gz",
-        "--path", str(Path("chaincode").resolve()),
-        "--lang", "golang",
+        "--path",  str(Path("chaincode").resolve()),
+        "--lang",  "golang",
         "--label", "security_logger_1.0",
     ], env=base_env)
 
-    # ── install: pass --tlsRootCertFiles explicitly to override SAN check ─
+    # ── install — use hostname so TLS SAN matches
     info("Installing chaincode (compiles Go — ~1 min) ...")
     rc = subprocess.call([
         "peer", "lifecycle", "chaincode", "install",
         "security_logger.tar.gz",
-        "--peerAddresses",   "localhost:7051",
+        "--peerAddresses",    PEER_ADDR,
         "--tlsRootCertFiles", peer_tls_ca,
     ], env=base_env)
     if rc != 0:
         warn("chaincode install returned non-zero — may already be installed, continuing")
 
-    # ── query installed → get package ID ──────────────────────────────────
+    # ── query installed → get package ID
     info("Querying installed chaincode ...")
     result = subprocess.run([
         "peer", "lifecycle", "chaincode", "queryinstalled",
-        "--peerAddresses",   "localhost:7051",
+        "--peerAddresses",    PEER_ADDR,
         "--tlsRootCertFiles", peer_tls_ca,
     ], env=base_env, capture_output=True, text=True)
     print(result.stdout)
@@ -572,7 +611,7 @@ def setup_channel_and_chaincode():
 
     ok(f"Package ID: {pkg_id}")
 
-    # ── approve ───────────────────────────────────────────────────────────
+    # ── approve
     info("Approving chaincode for Org1 ...")
     subprocess.call([
         "peer", "lifecycle", "chaincode", "approveformyorg",
@@ -584,12 +623,12 @@ def setup_channel_and_chaincode():
         "--package-id", pkg_id,
         "--sequence",   "1",
         "--tls", "--cafile", orderer_tls,
-        "--peerAddresses",   "localhost:7051",
+        "--peerAddresses",    PEER_ADDR,
         "--tlsRootCertFiles", peer_tls_ca,
     ], env=base_env)
     ok("Chaincode approved")
 
-    # ── commit ────────────────────────────────────────────────────────────
+    # ── commit
     info("Committing chaincode ...")
     subprocess.call([
         "peer", "lifecycle", "chaincode", "commit",
@@ -600,7 +639,7 @@ def setup_channel_and_chaincode():
         "--version",   "1.0",
         "--sequence",  "1",
         "--tls", "--cafile", orderer_tls,
-        "--peerAddresses",   "localhost:7051",
+        "--peerAddresses",    PEER_ADDR,
         "--tlsRootCertFiles", peer_tls_ca,
     ], env=base_env)
     ok("Chaincode committed — fully deployed on security-channel")
@@ -611,7 +650,6 @@ def setup_channel_and_chaincode():
 # ════════════════════════════════════════════════════════════════════════════
 
 def wait_for_port(port: int, timeout: int = 45) -> bool:
-    """Return True when a local TCP port accepts connections, False on timeout."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -624,8 +662,6 @@ def wait_for_port(port: int, timeout: int = 45) -> bool:
 
 def start_services():
     hdr("Step 5 — Start Python Microservices")
-
-    # Install all deps into .venv BEFORE launching any process
     venv_python, _venv_pip = ensure_venv()
 
     services = [
@@ -642,26 +678,28 @@ def start_services():
         log_path = Path(f"results/{name}.log")
         log_path.parent.mkdir(exist_ok=True)
         log_fh = open(log_path, "w")
+        # Run each service from its own directory so relative imports work
+        svc_dir = str(Path(script).parent.resolve())
         p = subprocess.Popen(
-            [venv_python, script],
-            stdout=log_fh, stderr=log_fh
+            [venv_python, "app.py"],
+            cwd=svc_dir,
+            stdout=log_fh,
+            stderr=log_fh,
         )
         procs.append((name, p, port, log_fh))
         info(f"Started {name} (pid {p.pid}) → :{port}  [log: {log_path}]")
 
-    # Health-check: wait for each port to actually be listening (up to 45 s)
     info("Waiting for services to bind (up to 45 s each) ...")
     all_up = True
     for name, p, port, _ in procs:
         if wait_for_port(port, timeout=45):
             ok(f"{name} is up on :{port}")
         else:
-            # Show last few lines of the log to help debug
             log_path = Path(f"results/{name}.log")
             tail = ""
             if log_path.exists():
                 lines = log_path.read_text().strip().splitlines()
-                tail = "\n    ".join(lines[-6:]) if lines else "(empty)"
+                tail = "\n    ".join(lines[-8:]) if lines else "(empty)"
             warn(f"{name} did NOT bind on :{port} within 45 s")
             warn(f"  Last log lines:\n    {tail}")
             all_up = False
@@ -707,7 +745,8 @@ class MockBlockchain:
         return [r for r in self.ledger if r.get("severity") == severity]
 
     def verify_integrity(self, record):
-        skip = {"tx_id","block_number","ipfs_cid","sha256","timestamp","org_msp","signature"}
+        skip = {"tx_id", "block_number", "ipfs_cid", "sha256",
+                "timestamp", "org_msp", "signature"}
         copy = {k: v for k, v in record.items() if k not in skip}
         payload = json.dumps(copy, sort_keys=True).encode()
         return hashlib.sha256(payload).hexdigest() == record["sha256"]
@@ -763,7 +802,8 @@ def run_mock_simulation() -> dict:
         ok_ = chain.verify_integrity(rec)
         status = f"{GREEN}PASS{RESET}" if ok_ else f"{RED}FAIL{RESET}"
         print(f"  Block {rec['block_number']:>3}  SHA-256 verify: {status}")
-        if not ok_: all_pass = False
+        if not ok_:
+            all_pass = False
     if all_pass:
         ok("All records passed SHA-256 integrity check")
 
@@ -828,8 +868,8 @@ def run_mock_simulation() -> dict:
             "total_events": batch_size,
             "total_time_s": round(total_time, 3),
             "tps": round(tps, 1),
-            "latency_ms": {"mean": round(mean,3), "p50": round(p50,3),
-                           "p95": round(p95,3), "p99": round(p99,3)},
+            "latency_ms": {"mean": round(mean, 3), "p50": round(p50, 3),
+                           "p95": round(p95, 3), "p99": round(p99, 3)},
         },
         "compliance_report": compliance,
         "severity_breakdown": {
@@ -857,7 +897,7 @@ def run_live_demo_and_benchmark() -> dict:
             r.raise_for_status()
             data = r.json()
             tx_ids.append(data.get("tx_id", ""))
-            ok(f"  {ev['severity']:<8} {ev['asset_id']:<28} → tx={data.get('tx_id','?')[:16]}…")
+            ok(f"  {ev['severity']:<8} {ev['asset_id']:<28} → event_id={data.get('event_id','?')[:16]}…")
         except Exception as e:
             warn(f"  {ev['asset_id']}: {e}")
 
@@ -893,11 +933,12 @@ def run_live_demo_and_benchmark() -> dict:
         except Exception:
             errors += 1
     total_time = time.perf_counter() - t_start
+    n = len(latencies)
     tps  = 500 / total_time
-    p50  = statistics.median(latencies) if latencies else 0
-    p95  = sorted(latencies)[int(0.95 * len(latencies))] if latencies else 0
-    p99  = sorted(latencies)[int(0.99 * len(latencies))] if latencies else 0
-    mean = statistics.mean(latencies) if latencies else 0
+    p50  = statistics.median(latencies) if n else 0
+    p95  = sorted(latencies)[int(0.95 * n)] if n else 0
+    p99  = sorted(latencies)[int(0.99 * n)] if n else 0
+    mean = statistics.mean(latencies) if n else 0
 
     ok(f"Benchmark: {tps:.0f} TPS  errors={errors}  mean={mean:.1f}ms  p95={p95:.1f}ms  p99={p99:.1f}ms")
 
@@ -911,8 +952,8 @@ def run_live_demo_and_benchmark() -> dict:
             "errors": errors,
             "total_time_s": round(total_time, 3),
             "tps": round(tps, 1),
-            "latency_ms": {"mean": round(mean,3), "p50": round(p50,3),
-                           "p95": round(p95,3), "p99": round(p99,3)},
+            "latency_ms": {"mean": round(mean, 3), "p50": round(p50, 3),
+                           "p95": round(p95, 3), "p99": round(p99, 3)},
         },
         "compliance_report": {"standard": "ISO-27001", "status": "COMPLIANT"},
     }
@@ -927,24 +968,24 @@ def print_and_save_results(results: dict):
     b   = results.get("benchmark", {})
     lat = b.get("latency_ms", {})
     print(f"""
-  Mode              : {results.get('mode','?').upper()}
-  Run at            : {results.get('run_at','')}
-  Events logged     : {results.get('events_logged', b.get('total_events','?'))}
+  Mode              : {results.get('mode', '?').upper()}
+  Run at            : {results.get('run_at', '')}
+  Events logged     : {results.get('events_logged', b.get('total_events', '?'))}
   Integrity verified: {results.get('integrity_pass', 'N/A')}
 
-  ── Benchmark ────────────────────────────
-  Total events      : {b.get('total_events','?')}
-  Total time        : {b.get('total_time_s','?')} s
-  Throughput (TPS)  : {b.get('tps','?')}
-  Latency mean      : {lat.get('mean','?')} ms
-  Latency p50       : {lat.get('p50','?')} ms
-  Latency p95       : {lat.get('p95','?')} ms
-  Latency p99       : {lat.get('p99','?')} ms
+  ── Benchmark ────────────────────────
+  Total events      : {b.get('total_events', '?')}
+  Total time        : {b.get('total_time_s', '?')} s
+  Throughput (TPS)  : {b.get('tps', '?')}
+  Latency mean      : {lat.get('mean', '?')} ms
+  Latency p50       : {lat.get('p50', '?')} ms
+  Latency p95       : {lat.get('p95', '?')} ms
+  Latency p99       : {lat.get('p99', '?')} ms
   Errors            : {b.get('errors', 0)}
 
-  ── Compliance ───────────────────────────
-  Standard          : {results.get('compliance_report',{}).get('standard','ISO-27001')}
-  Status            : {results.get('compliance_report',{}).get('status','N/A')}
+  ── Compliance ───────────────────────
+  Standard          : {results.get('compliance_report', {}).get('standard', 'ISO-27001')}
+  Status            : {results.get('compliance_report', {}).get('status', 'N/A')}
   ─────────────────────────────────────────
 """)
     RESULTS_FILE.write_text(json.dumps(results, indent=2))
@@ -957,10 +998,12 @@ def print_and_save_results(results: dict):
 
 def main():
     parser = argparse.ArgumentParser(description="Objective 2 — End-to-end executor")
-    parser.add_argument("--mock",         action="store_true", help="Mock simulation (no Docker)")
-    parser.add_argument("--teardown",     action="store_true", help="Stop Docker stack")
-    parser.add_argument("--results-only", action="store_true", help="Print last results")
-    parser.add_argument("--skip-docker",  action="store_true", help="Skip Docker/channel steps")
+    parser.add_argument("--mock",          action="store_true", help="Mock simulation (no Docker)")
+    parser.add_argument("--teardown",      action="store_true", help="Stop Docker stack")
+    parser.add_argument("--results-only",  action="store_true", help="Print last results")
+    parser.add_argument("--skip-docker",   action="store_true", help="Skip Docker/channel steps")
+    parser.add_argument("--inject-hosts",  action="store_true",
+                        help="Only inject Fabric hostnames into /etc/hosts then exit")
     args = parser.parse_args()
 
     print(f"""
@@ -970,6 +1013,10 @@ def main():
 ║  Hyperledger Fabric + IPFS + AI-Driven Cloud Security    ║
 ╚══════════════════════════════════════════════════════════╝
 {RESET}""")
+
+    if args.inject_hosts:
+        inject_etc_hosts()
+        return
 
     if args.results_only:
         if RESULTS_FILE.exists():
