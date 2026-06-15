@@ -1,0 +1,67 @@
+{
+  "title": "Cloud Security Logging — Overview",
+  "uid": "csl-overview",
+  "schemaVersion": 38,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Events Produced (1m rate)",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "sum(rate(detector_events_produced_total[1m]))", "legendFormat": "events/s" }]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Events Logged to Blockchain (1m rate)",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "sum(rate(logger_events_logged_total[1m]))", "legendFormat": "logged/s" }]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Failed Events (1m rate)",
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "sum(rate(logger_events_failed_total[1m]))", "legendFormat": "failures/s" }],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "color": "green", "value": 0 }, { "color": "red", "value": 0.1 }] } } }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Consumer Lag",
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "expr": "logger_consumer_lag", "legendFormat": "lag" }]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Ingestion Latency (p50/p95/p99)",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(detector_ingestion_latency_seconds_bucket[5m]))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, rate(detector_ingestion_latency_seconds_bucket[5m]))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, rate(detector_ingestion_latency_seconds_bucket[5m]))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Blockchain Log Latency (p50/p95/p99)",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(logger_event_log_latency_seconds_bucket[5m]))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, rate(logger_event_log_latency_seconds_bucket[5m]))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, rate(logger_event_log_latency_seconds_bucket[5m]))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "piechart",
+      "title": "Events by Severity",
+      "gridPos": { "x": 0, "y": 12, "w": 8, "h": 8 },
+      "targets": [{ "expr": "sum by (severity) (logger_events_logged_total)", "legendFormat": "{{ severity }}" }]
+    }
+  ]
+}

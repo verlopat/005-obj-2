@@ -1,0 +1,47 @@
+groups:
+  - name: security-logging-alerts
+    rules:
+      - alert: HighCriticalEventRate
+        expr: rate(detector_events_produced_total{severity="CRITICAL"}[5m]) > 10
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High rate of CRITICAL security events"
+          description: "More than 10 CRITICAL events/sec for 2 consecutive minutes."
+
+      - alert: BlockchainLoggerFailing
+        expr: rate(logger_events_failed_total[5m]) > 0
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Blockchain logger experiencing failures"
+          description: "Events are failing to be logged to the blockchain."
+
+      - alert: KafkaConsumerLag
+        expr: logger_consumer_lag > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka consumer lag is high"
+          description: "Consumer lag exceeds 1000 messages for more than 5 minutes."
+
+      - alert: HighIngestionLatency
+        expr: histogram_quantile(0.99, rate(detector_ingestion_latency_seconds_bucket[5m])) > 1.0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ingestion p99 latency above 1s"
+          description: "99th percentile ingestion latency exceeds 1 second."
+
+      - alert: FabricEndorserDown
+        expr: up{job="fabric-peer"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Fabric peer is down"
+          description: "Peer {{ $labels.instance }} is unreachable."
