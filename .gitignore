@@ -1,0 +1,6 @@
+chaincode/vendor/
+chaincode/vendor/
+chaincode/vendor/
+fabric-samples/chaincode/security_logger/vendor/
+venv/
+secret.key
