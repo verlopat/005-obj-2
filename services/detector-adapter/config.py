@@ -2,7 +2,6 @@
 import os
 from dataclasses import dataclass
 
-
 @dataclass
 class Config:
     kafka_bootstrap_servers: str = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
@@ -17,8 +16,5 @@ class Config:
     api_workers: int = int(os.getenv("API_WORKERS", "4"))
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     metrics_port: int = int(os.getenv("METRICS_PORT", "9090"))
-    max_batch_size: int = int(os.getenv("MAX_BATCH_SIZE", "100"))
-    request_timeout_seconds: int = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
-
 
 config = Config()

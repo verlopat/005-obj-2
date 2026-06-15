@@ -4,7 +4,6 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 from pydantic import BaseModel
 
-
 class SecurityEventMessage(BaseModel):
     event_id: str
     asset_id: str
@@ -22,7 +21,6 @@ class SecurityEventMessage(BaseModel):
 
     class Config:
         extra = "allow"
-
 
 class LogResult(BaseModel):
     event_id: str

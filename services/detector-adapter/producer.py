@@ -3,13 +3,10 @@ import json
 import logging
 import threading
 from typing import Callable, Optional
-
 from confluent_kafka import Producer, KafkaException
-
 from config import config
 
 logger = logging.getLogger(__name__)
-
 
 class SecurityEventProducer:
     def __init__(self):
@@ -30,7 +27,6 @@ class SecurityEventProducer:
                         "enable.idempotence": True,
                         "max.in.flight.requests.per.connection": 5,
                         "delivery.timeout.ms": 30000,
-                        "request.timeout.ms": 15000,
                     }
                     self._producer = Producer(conf)
                     self._healthy = True
@@ -41,10 +37,8 @@ class SecurityEventProducer:
         if err:
             logger.error("Delivery failed for event %s: %s", msg.key(), err)
         else:
-            logger.debug(
-                "Event %s delivered to %s [%d] offset %d",
-                msg.key(), msg.topic(), msg.partition(), msg.offset(),
-            )
+            logger.debug("Event %s delivered to %s [%d] offset %d",
+                         msg.key(), msg.topic(), msg.partition(), msg.offset())
 
     def produce(self, event_id: str, payload: dict, on_delivery: Optional[Callable] = None) -> None:
         producer = self._get_producer()
@@ -84,6 +78,5 @@ class SecurityEventProducer:
             self._producer.flush(30)
             self._producer = None
             self._healthy = False
-
 
 producer = SecurityEventProducer()

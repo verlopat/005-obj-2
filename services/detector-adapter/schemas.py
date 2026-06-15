@@ -4,16 +4,13 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 from uuid import UUID, uuid4
-
 from pydantic import BaseModel, Field, validator
-
 
 class SeverityLevel(str, Enum):
     LOW = "LOW"
     MEDIUM = "MEDIUM"
     HIGH = "HIGH"
     CRITICAL = "CRITICAL"
-
 
 class AttackCategory(str, Enum):
     DDOS = "DDOS"
@@ -24,7 +21,6 @@ class AttackCategory(str, Enum):
     LATERAL_MOVEMENT = "LATERAL_MOVEMENT"
     ANOMALY = "ANOMALY"
     UNKNOWN = "UNKNOWN"
-
 
 class SecurityEventRequest(BaseModel):
     event_id: UUID = Field(default_factory=uuid4)
@@ -48,10 +44,8 @@ class SecurityEventRequest(BaseModel):
     class Config:
         json_encoders = {datetime: lambda v: v.isoformat() + "Z", UUID: str}
 
-
 class BatchEventRequest(BaseModel):
     events: List[SecurityEventRequest] = Field(..., min_items=1, max_items=100)
-
 
 class EventResponse(BaseModel):
     event_id: str
@@ -59,12 +53,10 @@ class EventResponse(BaseModel):
     kafka_offset: Optional[int] = None
     message: str = "Event accepted"
 
-
 class BatchEventResponse(BaseModel):
     accepted: int
     rejected: int
     results: List[EventResponse]
-
 
 class HealthResponse(BaseModel):
     status: str

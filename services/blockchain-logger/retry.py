@@ -3,19 +3,17 @@ import functools
 import logging
 import random
 import time
-from typing import Callable, Optional, Tuple, Type
+from typing import Callable, Tuple, Type
 
 logger = logging.getLogger(__name__)
-
 
 def exponential_backoff(
     max_retries: int = 5,
     base_delay: float = 1.0,
     max_delay: float = 60.0,
     exceptions: Tuple[Type[Exception], ...] = (Exception,),
-    on_retry: Optional[Callable] = None,
+    on_retry: Callable = None,
 ):
-    """Retry with exponential backoff + full jitter on the specified exceptions."""
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
@@ -28,8 +26,8 @@ def exponential_backoff(
                     if attempt == max_retries:
                         logger.error("%s failed after %d attempts: %s", func.__name__, max_retries, exc)
                         raise
-                    cap = min(base_delay * (2 ** attempt), max_delay)
-                    jitter = random.uniform(0, cap)
+                    delay = min(base_delay * (2 ** attempt), max_delay)
+                    jitter = random.uniform(0, delay)
                     logger.warning("%s attempt %d/%d failed: %s — retrying in %.2fs",
                                    func.__name__, attempt + 1, max_retries, exc, jitter)
                     if on_retry:
