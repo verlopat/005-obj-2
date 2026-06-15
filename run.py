@@ -34,11 +34,13 @@ CYAN   = "\033[96m"
 BOLD   = "\033[1m"
 RESET  = "\033[0m"
 
-def ok(msg):   print(f"{GREEN}  ✔  {msg}{RESET}")
-def warn(msg): print(f"{YELLOW}  ⚠  {msg}{RESET}")
-def err(msg):  print(f"{RED}  ✘  {msg}{RESET}")
-def info(msg): print(f"{CYAN}  ▶  {msg}{RESET}")
-def hdr(msg):  print(f"\n{BOLD}{CYAN}{────────────────────────────────────────────────────────────}\n  {msg}\n{────────────────────────────────────────────────────────────}{RESET}")
+SEP = "-" * 60
+
+def ok(msg):   print(f"{GREEN}  \u2714  {msg}{RESET}")
+def warn(msg): print(f"{YELLOW}  \u26a0  {msg}{RESET}")
+def err(msg):  print(f"{RED}  \u2718  {msg}{RESET}")
+def info(msg): print(f"{CYAN}  \u25b6  {msg}{RESET}")
+def hdr(msg):  print(f"\n{BOLD}{CYAN}{SEP}\n  {msg}\n{SEP}{RESET}")
 
 RESULTS_FILE = Path("results/run_results.json")
 RESULTS_FILE.parent.mkdir(exist_ok=True)
@@ -54,7 +56,7 @@ FABRIC_HOSTS = [
 ]
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================
 def ensure_venv():
     """Create .venv if absent; install all service requirements; return (python, pip) paths."""
     venv_python = str(VENV_DIR / "bin" / "python")
@@ -78,25 +80,21 @@ def ensure_venv():
     return venv_python, venv_pip
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# /etc/hosts injection — ensures Fabric hostnames resolve to 127.0.0.1
-# so that TLS SANs match when the peer CLI connects via the Docker-published port.
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================
+# /etc/hosts injection
+# ============================================================
 
 def _hosts_already_patched() -> bool:
     try:
         content = Path("/etc/hosts").read_text()
         return "peer0.org1.example.com" in content
     except Exception:
-        return True  # can’t read — assume ok, skip
+        return True
 
 
 def inject_etc_hosts():
-    """Add Fabric hostname → 127.0.0.1 entries to /etc/hosts if not already present.
-    Requires sudo; skips gracefully if not root and sudo is unavailable.
-    """
     if platform.system() != "Linux":
-        return  # /etc/hosts injection only needed on Linux (macOS Docker uses host.docker.internal)
+        return
 
     if _hosts_already_patched():
         ok("Fabric hostnames already in /etc/hosts")
@@ -106,7 +104,6 @@ def inject_etc_hosts():
     for h in FABRIC_HOSTS:
         entries += f"127.0.0.1  {h}\n"
 
-    # Try passwordless sudo first, then fall back to tee with sudo
     try:
         result = subprocess.run(
             ["sudo", "tee", "-a", "/etc/hosts"],
@@ -120,7 +117,6 @@ def inject_etc_hosts():
     except FileNotFoundError:
         pass
 
-    # sudo not available — try direct write (works if running as root)
     try:
         with open("/etc/hosts", "a") as fh:
             fh.write(entries)
@@ -135,9 +131,9 @@ def inject_etc_hosts():
     warn("Or run: python run.py --inject-hosts  (uses sudo)")
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================
 # FABRIC_CFG_PATH auto-detection
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================
 
 def find_fabric_cfg_path() -> str:
     candidates = [
@@ -366,9 +362,9 @@ metrics:
     return str(cfg_dir)
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================
 # 1. PREREQUISITE CHECKS
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================
 
 def check_prereqs(mock: bool) -> bool:
     hdr("Step 1 — Prerequisite Check")
@@ -413,9 +409,9 @@ def check_prereqs(mock: bool) -> bool:
     return all_ok
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================
 # 2. CRYPTO + GENESIS
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================
 
 def generate_crypto_and_genesis():
     hdr("Step 2 — Generate Crypto Material & Genesis Block")
@@ -471,9 +467,9 @@ PeerOrgs:
         ok("security-channel.tx already exists — skipping")
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================
 # 3. DOCKER STACK
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================
 
 def start_docker_stack():
     hdr("Step 3 — Start Docker Stack")
@@ -498,21 +494,20 @@ def teardown_docker_stack():
     ok("Stack stopped and volumes removed")
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================
 # 4. CHANNEL + CHAINCODE SETUP
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================
 
 def setup_channel_and_chaincode():
     hdr("Step 4 — Create Channel & Deploy Chaincode")
 
-    # ── TLS FIX: ensure peer hostnames resolve to 127.0.0.1 before ANY peer CLI call
     inject_etc_hosts()
 
     fabric_cfg = find_fabric_cfg_path()
     info(f"Using FABRIC_CFG_PATH={fabric_cfg}")
 
-    PEER_ADDR        = "peer0.org1.example.com:7051"  # matches cert SAN
-    ORDERER_ADDR     = "orderer.example.com:7050"     # matches cert SAN
+    PEER_ADDR        = "peer0.org1.example.com:7051"
+    ORDERER_ADDR     = "orderer.example.com:7050"
     ORDERER_HOSTNAME = "orderer.example.com"
 
     peer_tls_ca = str(
@@ -537,7 +532,6 @@ def setup_channel_and_chaincode():
         "CORE_PEER_TLS_ROOTCERT_FILE": peer_tls_ca,
     }
 
-    # ── channel create
     block = Path("channel-artifacts/security-channel.block")
     if not block.exists():
         info("Creating channel ...")
@@ -554,7 +548,6 @@ def setup_channel_and_chaincode():
     else:
         ok("security-channel.block already exists — skipping create")
 
-    # ── peer join
     info("Joining peer0 to channel ...")
     rc = subprocess.call(
         ["peer", "channel", "join", "-b", str(block.resolve())],
@@ -565,7 +558,6 @@ def setup_channel_and_chaincode():
     else:
         warn(f"peer channel join exited {rc} — peer may already be joined, continuing")
 
-    # ── chaincode package
     info("Packaging chaincode ...")
     subprocess.call(["go", "mod", "tidy"], cwd="chaincode")
     subprocess.call([
@@ -576,7 +568,6 @@ def setup_channel_and_chaincode():
         "--label", "security_logger_1.0",
     ], env=base_env)
 
-    # ── install — use hostname so TLS SAN matches
     info("Installing chaincode (compiles Go — ~1 min) ...")
     rc = subprocess.call([
         "peer", "lifecycle", "chaincode", "install",
@@ -587,7 +578,6 @@ def setup_channel_and_chaincode():
     if rc != 0:
         warn("chaincode install returned non-zero — may already be installed, continuing")
 
-    # ── query installed → get package ID
     info("Querying installed chaincode ...")
     result = subprocess.run([
         "peer", "lifecycle", "chaincode", "queryinstalled",
@@ -611,7 +601,6 @@ def setup_channel_and_chaincode():
 
     ok(f"Package ID: {pkg_id}")
 
-    # ── approve
     info("Approving chaincode for Org1 ...")
     subprocess.call([
         "peer", "lifecycle", "chaincode", "approveformyorg",
@@ -628,7 +617,6 @@ def setup_channel_and_chaincode():
     ], env=base_env)
     ok("Chaincode approved")
 
-    # ── commit
     info("Committing chaincode ...")
     subprocess.call([
         "peer", "lifecycle", "chaincode", "commit",
@@ -645,9 +633,9 @@ def setup_channel_and_chaincode():
     ok("Chaincode committed — fully deployed on security-channel")
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# 5. START PYTHON SERVICES (inside .venv)
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================
+# 5. START PYTHON SERVICES
+# ============================================================
 
 def wait_for_port(port: int, timeout: int = 45) -> bool:
     deadline = time.time() + timeout
@@ -678,7 +666,6 @@ def start_services():
         log_path = Path(f"results/{name}.log")
         log_path.parent.mkdir(exist_ok=True)
         log_fh = open(log_path, "w")
-        # Run each service from its own directory so relative imports work
         svc_dir = str(Path(script).parent.resolve())
         p = subprocess.Popen(
             [venv_python, "app.py"],
@@ -687,7 +674,7 @@ def start_services():
             stderr=log_fh,
         )
         procs.append((name, p, port, log_fh))
-        info(f"Started {name} (pid {p.pid}) → :{port}  [log: {log_path}]")
+        info(f"Started {name} (pid {p.pid}) -> :{port}  [log: {log_path}]")
 
     info("Waiting for services to bind (up to 45 s each) ...")
     all_up = True
@@ -710,9 +697,9 @@ def start_services():
     return procs, all_up
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================
 # 6. MOCK MODE
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================
 
 class MockBlockchain:
     def __init__(self):
@@ -793,8 +780,8 @@ def run_mock_simulation() -> dict:
         latencies.append(lat)
         records.append(rec)
         print(f"  [{rec['block_number']:>3}] {rec['severity']:<8}  "
-              f"{rec['asset_id']:<30}  tx={rec['tx_id'][:16]}…  "
-              f"CID={rec['ipfs_cid'][:20]}…  {lat:.3f} ms")
+              f"{rec['asset_id']:<30}  tx={rec['tx_id'][:16]}...  "
+              f"CID={rec['ipfs_cid'][:20]}...  {lat:.3f} ms")
 
     hdr("Step 3 — Integrity Verification")
     all_pass = True
@@ -818,7 +805,7 @@ def run_mock_simulation() -> dict:
     hdr("Step 5 — Severity Report")
     for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]:
         count = len(chain.query_by_severity(sev))
-        print(f"  {sev:<10} {'█' * count:<20} {count}")
+        print(f"  {sev:<10} {'#' * count:<20} {count}")
 
     hdr("Step 6 — Benchmark (1 000 events)")
     bench_lat, batch_size = [], 1000
@@ -879,9 +866,9 @@ def run_mock_simulation() -> dict:
     }
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================
 # 7. LIVE MODE
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================
 
 def run_live_demo_and_benchmark() -> dict:
     import requests
@@ -897,7 +884,7 @@ def run_live_demo_and_benchmark() -> dict:
             r.raise_for_status()
             data = r.json()
             tx_ids.append(data.get("tx_id", ""))
-            ok(f"  {ev['severity']:<8} {ev['asset_id']:<28} → event_id={data.get('event_id','?')[:16]}…")
+            ok(f"  {ev['severity']:<8} {ev['asset_id']:<28} -> event_id={data.get('event_id','?')[:16]}...")
         except Exception as e:
             warn(f"  {ev['asset_id']}: {e}")
 
@@ -959,9 +946,9 @@ def run_live_demo_and_benchmark() -> dict:
     }
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================
 # 8. PRINT & SAVE RESULTS
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================
 
 def print_and_save_results(results: dict):
     hdr("Results Summary")
@@ -973,7 +960,7 @@ def print_and_save_results(results: dict):
   Events logged     : {results.get('events_logged', b.get('total_events', '?'))}
   Integrity verified: {results.get('integrity_pass', 'N/A')}
 
-  ── Benchmark ────────────────────────
+  -- Benchmark ---------------------------------
   Total events      : {b.get('total_events', '?')}
   Total time        : {b.get('total_time_s', '?')} s
   Throughput (TPS)  : {b.get('tps', '?')}
@@ -983,18 +970,18 @@ def print_and_save_results(results: dict):
   Latency p99       : {lat.get('p99', '?')} ms
   Errors            : {b.get('errors', 0)}
 
-  ── Compliance ───────────────────────
+  -- Compliance --------------------------------
   Standard          : {results.get('compliance_report', {}).get('standard', 'ISO-27001')}
   Status            : {results.get('compliance_report', {}).get('status', 'N/A')}
-  ─────────────────────────────────────────
+  ---------------------------------------------
 """)
     RESULTS_FILE.write_text(json.dumps(results, indent=2))
-    ok(f"Results saved → {RESULTS_FILE}")
+    ok(f"Results saved -> {RESULTS_FILE}")
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================
 # MAIN
-# ════════════════════════════════════════════════════════════════════════════
+# ============================================================
 
 def main():
     parser = argparse.ArgumentParser(description="Objective 2 — End-to-end executor")
@@ -1008,10 +995,10 @@ def main():
 
     print(f"""
 {BOLD}{CYAN}
-╔══════════════════════════════════════════════════════════╗
-║  Objective 2 — Blockchain Immutable Audit Trail Runner   ║
-║  Hyperledger Fabric + IPFS + AI-Driven Cloud Security    ║
-╚══════════════════════════════════════════════════════════╝
++----------------------------------------------------------+
+|  Objective 2 - Blockchain Immutable Audit Trail Runner   |
+|  Hyperledger Fabric + IPFS + AI-Driven Cloud Security    |
++----------------------------------------------------------+
 {RESET}""")
 
     if args.inject_hosts:
