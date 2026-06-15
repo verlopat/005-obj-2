@@ -1,0 +1,8 @@
+{
+  "index": {
+    "fields": ["cloud_asset_id", "timestamp"]
+  },
+  "ddoc": "indexAssetTimestampDoc",
+  "name": "indexAssetTimestamp",
+  "type": "json"
+}

@@ -2,10 +2,12 @@
 crypto-config/
 channel-artifacts/
 
-# Secret keys
+# Secret and AES keys — managed at runtime, never committed
 *.key
 *.pem
 *_sk
+.aes_key
+secret.key
 
 # Python
 __pycache__/
@@ -36,6 +38,9 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Benchmark results (committed manually for thesis appendix)
+# results/  <- intentionally NOT ignored, so evidence can be committed
 
 # fabric-samples submodule (populated at runtime)
 fabric-samples/

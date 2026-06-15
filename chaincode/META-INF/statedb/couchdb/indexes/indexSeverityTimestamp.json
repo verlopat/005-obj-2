@@ -1,0 +1,8 @@
+{
+  "index": {
+    "fields": ["severity", "timestamp"]
+  },
+  "ddoc": "indexSeverityTimestampDoc",
+  "name": "indexSeverityTimestamp",
+  "type": "json"
+}
