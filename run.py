@@ -48,19 +48,14 @@ RESULTS_FILE.parent.mkdir(exist_ok=True)
 
 # ════════════════════════════════════════════════════════════════════════════
 # FABRIC_CFG_PATH auto-detection
-# The 'peer' binary requires core.yaml. It ships in fabric-samples/config/.
-# We search common locations and fall back to writing a minimal core.yaml.
 # ════════════════════════════════════════════════════════════════════════════
 
 def find_fabric_cfg_path() -> str:
     """Return the directory containing core.yaml for the peer binary."""
     candidates = [
-        # Same repo: curl script drops fabric-samples next to us
         Path(__file__).parent / "fabric-samples" / "config",
-        # Home directory (common install target)
         Path.home() / "fabric-samples" / "config",
         Path.home() / "go" / "src" / "github.com" / "hyperledger" / "fabric-samples" / "config",
-        # Already set in environment
         Path(os.environ.get("FABRIC_CFG_PATH", "")),
     ]
     for c in candidates:
@@ -341,11 +336,9 @@ def check_prereqs(mock: bool) -> bool:
                      "run: curl -sSL https://bit.ly/2ysbOFE | bash -s -- 2.5.0 1.5.0")
                 all_ok = False
 
-        # Detect and report FABRIC_CFG_PATH
         cfg = find_fabric_cfg_path()
         ok(f"FABRIC_CFG_PATH: {cfg}")
 
-    # Python packages
     required = ["requests", "cryptography"]
     for pkg in required:
         try:
@@ -459,6 +452,13 @@ def setup_channel_and_chaincode():
     fabric_cfg = find_fabric_cfg_path()
     info(f"Using FABRIC_CFG_PATH={fabric_cfg}")
 
+    # The TLS cert is issued for orderer.example.com but we connect via
+    # localhost:7050 (port-forwarded from docker-compose).
+    # --ordererTLSHostnameOverride tells gRPC to verify the cert against
+    # the real hostname instead of the dial address.
+    ORDERER_ADDR     = "localhost:7050"
+    ORDERER_HOSTNAME = "orderer.example.com"
+
     base_env = {
         **os.environ,
         "FABRIC_CFG_PATH": fabric_cfg,
@@ -484,7 +484,8 @@ def setup_channel_and_chaincode():
         info("Creating channel …")
         subprocess.check_call([
             "peer", "channel", "create",
-            "-o", "localhost:7050",
+            "-o", ORDERER_ADDR,
+            "--ordererTLSHostnameOverride", ORDERER_HOSTNAME,
             "-c", "security-channel",
             "-f", str(Path("channel-artifacts/security-channel.tx").resolve()),
             "--outputBlock", str(block.resolve()),
@@ -516,7 +517,59 @@ def setup_channel_and_chaincode():
         "peer", "lifecycle", "chaincode", "install",
         "security_logger.tar.gz",
     ], env=base_env)
-    ok("Chaincode installed — complete lifecycle steps (approve/commit) if needed")
+
+    # Query installed to get package ID for approve/commit
+    info("Querying installed chaincode …")
+    result = subprocess.run([
+        "peer", "lifecycle", "chaincode", "queryinstalled",
+    ], env=base_env, capture_output=True, text=True)
+    print(result.stdout)
+
+    # Extract package ID (format: security_logger_1.0:<hash>)
+    pkg_id = ""
+    for line in result.stdout.splitlines():
+        if "security_logger_1.0" in line and "Package ID:" in line:
+            pkg_id = line.split("Package ID:")[1].split(",")[0].strip()
+            break
+
+    if not pkg_id:
+        warn("Could not parse package ID — skipping approve/commit steps")
+        warn("Run manually:  peer lifecycle chaincode queryinstalled")
+        return
+
+    ok(f"Package ID: {pkg_id}")
+
+    info("Approving chaincode for Org1 …")
+    subprocess.call([
+        "peer", "lifecycle", "chaincode", "approveformyorg",
+        "-o", ORDERER_ADDR,
+        "--ordererTLSHostnameOverride", ORDERER_HOSTNAME,
+        "--channelID", "security-channel",
+        "--name", "security_logger",
+        "--version", "1.0",
+        "--package-id", pkg_id,
+        "--sequence", "1",
+        "--tls", "--cafile", orderer_tls,
+    ], env=base_env)
+    ok("Chaincode approved")
+
+    info("Committing chaincode …")
+    subprocess.call([
+        "peer", "lifecycle", "chaincode", "commit",
+        "-o", ORDERER_ADDR,
+        "--ordererTLSHostnameOverride", ORDERER_HOSTNAME,
+        "--channelID", "security-channel",
+        "--name", "security_logger",
+        "--version", "1.0",
+        "--sequence", "1",
+        "--tls", "--cafile", orderer_tls,
+        "--peerAddresses", "localhost:7051",
+        "--tlsRootCertFiles", str(
+            Path("crypto-config/peerOrganizations/org1.example.com"
+                 "/peers/peer0.org1.example.com/tls/ca.crt").resolve()
+        ),
+    ], env=base_env)
+    ok("Chaincode committed — fully deployed on security-channel")
 
 
 # ════════════════════════════════════════════════════════════════════════════
