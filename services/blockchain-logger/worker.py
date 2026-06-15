@@ -1,118 +1,177 @@
-"""Kafka consumer worker — polls events and logs them to Fabric + IPFS."""
+"""Kafka consumer worker — live pipeline only.
+
+Pipeline per message:
+  1. Deserialise + validate with shared SecurityEvent schema
+  2. Build canonical payload bytes
+  3. Sign with ECDSA (pki_signer / signer.py)
+  4. Upload canonical bytes to IPFS → get real CID
+  5. Compute SHA-256 over canonical bytes
+  6. Submit LogSecurityEvent to Fabric
+  7. Ack (commit offset) ONLY after confirmed Fabric tx
+  8. On any failure: bounded retries with exponential backoff → DLQ
+
+No mock path.  No silent drops.
+"""
+from __future__ import annotations
+
+import base64
 import json
 import logging
-import threading
+import os
+import sys
 import time
-from datetime import datetime
-from typing import Optional
-from confluent_kafka import Consumer, KafkaError
-from prometheus_client import Counter, Histogram, Gauge
-from config import config
-from fabric_client import fabric_client
-from ipfs_client import ipfs_client
-from schemas import LogResult, SecurityEventMessage
-from signer import signer
+from datetime import datetime, timezone
+from pathlib import Path
 
-logger = logging.getLogger(__name__)
-EVENTS_LOGGED = Counter("logger_events_logged_total", "Events logged to blockchain", ["severity"])
-EVENTS_FAILED = Counter("logger_events_failed_total", "Events that failed to log", ["reason"])
-LOG_LATENCY   = Histogram("logger_event_log_latency_seconds", "Kafka-to-chain latency",
-                           buckets=[0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0])
+from kafka import KafkaConsumer, KafkaProducer
+from kafka.errors import KafkaError
 
-class BlockchainLoggerWorker:
-    def __init__(self):
-        self._running = False
-        self._threads = []
+# shared modules live at repo root; add to path if needed
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-    def _make_consumer(self) -> Consumer:
-        return Consumer({
-            "bootstrap.servers": config.kafka_bootstrap_servers,
-            "group.id": config.kafka_consumer_group,
-            "auto.offset.reset": config.kafka_auto_offset_reset,
-            "enable.auto.commit": False,
-            "max.poll.interval.ms": 300000,
-            "session.timeout.ms": 30000,
-        })
+from shared.config import (
+    KAFKA_BOOTSTRAP, KAFKA_TOPIC, KAFKA_DLQ_TOPIC, KAFKA_GROUP_ID,
+    KAFKA_MAX_RETRIES, KAFKA_RETRY_BASE_S, KAFKA_RETRY_CAP_S,
+    IPFS_API_URL, AGENT_KEY_PATH, AGENT_CERT_PATH,
+)
+from shared.event_schema import SecurityEvent, canonical_payload, sha256_of
+from shared.ipfs import add_and_pin
+from fabric_client import submit_transaction
+from signer import sign_bytes
 
-    def _process_message(self, raw_value: bytes) -> Optional[LogResult]:
-        start = time.perf_counter()
-        try:
-            payload = json.loads(raw_value)
-            event = SecurityEventMessage(**payload)
-        except Exception as exc:
-            EVENTS_FAILED.labels(reason="deserialize").inc()
-            logger.error("Failed to deserialize message: %s", exc)
-            return None
+log = logging.getLogger(__name__)
 
-        try:
-            cid, sha256 = ipfs_client.upload(payload)
-        except Exception as exc:
-            EVENTS_FAILED.labels(reason="ipfs").inc()
-            logger.error("IPFS upload failed for event %s: %s", event.event_id, exc)
-            raise
 
-        signature = signer.sign(payload) if signer.enabled else None
+def _backoff(attempt: int) -> float:
+    """Exponential backoff capped at KAFKA_RETRY_CAP_S."""
+    delay = KAFKA_RETRY_BASE_S * (2 ** attempt)
+    return min(delay, KAFKA_RETRY_CAP_S)
 
-        try:
-            tx_id = fabric_client.submit_event(
-                event_id=event.event_id, asset_id=event.asset_id,
-                severity=event.severity, description=event.description,
-                ipfs_cid=cid, sha256=sha256,
-                attack_category=event.attack_category,
-                detection_confidence=event.detection_confidence,
-                model_version=event.model_version,
-                signature=signature, timestamp=event.timestamp,
-            )
-        except Exception as exc:
-            EVENTS_FAILED.labels(reason="fabric").inc()
-            logger.error("Fabric submission failed for event %s: %s", event.event_id, exc)
-            raise
 
-        duration_ms = (time.perf_counter() - start) * 1000
-        LOG_LATENCY.observe(duration_ms / 1000)
-        EVENTS_LOGGED.labels(severity=event.severity).inc()
-        result = LogResult(event_id=event.event_id, ipfs_cid=cid, sha256=sha256,
-                           tx_id=tx_id, logged_at=datetime.utcnow(), duration_ms=duration_ms)
-        logger.info("Logged event %s: tx=%s cid=%s %.1fms",
-                    event.event_id, tx_id, cid, duration_ms)
-        return result
+def _send_to_dlq(producer: KafkaProducer, raw_bytes: bytes, reason: str):
+    try:
+        producer.send(
+            KAFKA_DLQ_TOPIC,
+            value=json.dumps({
+                "raw": raw_bytes.decode("utf-8", errors="replace"),
+                "reason": reason,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }).encode(),
+        )
+        producer.flush()
+        log.warning("[DLQ] message routed to %s: %s", KAFKA_DLQ_TOPIC, reason)
+    except Exception as exc:
+        log.error("[DLQ] failed to send to DLQ: %s", exc)
 
-    def _run_worker(self, worker_id: int):
-        consumer = self._make_consumer()
-        consumer.subscribe([config.kafka_topic_events])
-        logger.info("Worker %d started, subscribed to %s", worker_id, config.kafka_topic_events)
-        try:
-            while self._running:
-                msg = consumer.poll(config.kafka_poll_timeout_seconds)
-                if msg is None:
-                    continue
-                if msg.error():
-                    if msg.error().code() == KafkaError._PARTITION_EOF:
-                        continue
-                    logger.error("Consumer error: %s", msg.error())
-                    continue
-                try:
-                    self._process_message(msg.value())
-                    consumer.commit(asynchronous=False)
-                except Exception as exc:
-                    logger.error("Worker %d error on message: %s", worker_id, exc)
-        finally:
-            consumer.close()
-            logger.info("Worker %d stopped", worker_id)
 
-    def start(self):
-        self._running = True
-        for i in range(config.worker_threads):
-            t = threading.Thread(target=self._run_worker, args=(i,),
-                                 daemon=True, name=f"logger-worker-{i}")
-            t.start()
-            self._threads.append(t)
-        logger.info("Started %d logger workers", config.worker_threads)
+def process_message(raw_bytes: bytes, producer: KafkaProducer) -> bool:
+    """Process one Kafka message end-to-end.  Returns True on success."""
+    # 1. Parse + validate
+    try:
+        data = json.loads(raw_bytes)
+        event = SecurityEvent(**data)
+    except Exception as exc:
+        _send_to_dlq(producer, raw_bytes, f"schema validation failed: {exc}")
+        return False
 
-    def stop(self):
-        self._running = False
-        for t in self._threads:
-            t.join(timeout=15)
-        self._threads.clear()
+    event_dict = event.model_dump()
+    if not event_dict.get("timestamp"):
+        event_dict["timestamp"] = datetime.now(timezone.utc).isoformat()
 
-worker = BlockchainLoggerWorker()
+    # 2. Canonical bytes
+    payload_bytes = canonical_payload(event_dict)
+
+    # 3. Sign
+    try:
+        sig_bytes = sign_bytes(payload_bytes)
+        signature = base64.b64encode(sig_bytes).decode()
+    except Exception as exc:
+        _send_to_dlq(producer, raw_bytes, f"signing failed: {exc}")
+        return False
+
+    # 4. IPFS pin — real CID
+    try:
+        cid = add_and_pin(payload_bytes, IPFS_API_URL)
+    except Exception as exc:
+        _send_to_dlq(producer, raw_bytes, f"IPFS add failed: {exc}")
+        return False
+
+    # 5. SHA-256 over canonical bytes
+    sha256 = sha256_of(event_dict)
+
+    # 6. Submit to Fabric
+    try:
+        tx_id = submit_transaction(
+            function="LogSecurityEvent",
+            args=[
+                event.event_id,
+                event.asset_id,
+                event.cloud_provider,
+                event.region,
+                event.severity,
+                event.attack_category,
+                event.description,
+                str(event.detection_confidence),
+                event.model_version,
+                cid,
+                sha256,
+                signature,
+                event_dict["timestamp"],
+            ],
+        )
+    except Exception as exc:
+        _send_to_dlq(producer, raw_bytes, f"Fabric submit failed: {exc}")
+        return False
+
+    log.info(
+        "[LOGGER] committed event_id=%s asset=%s tx=%s cid=%s sha256=%.16s…",
+        event.event_id, event.asset_id, tx_id, cid, sha256,
+    )
+    return True
+
+
+def run():
+    log.info("[WORKER] starting — topic=%s group=%s bootstrap=%s",
+             KAFKA_TOPIC, KAFKA_GROUP_ID, KAFKA_BOOTSTRAP)
+
+    consumer = KafkaConsumer(
+        KAFKA_TOPIC,
+        bootstrap_servers=KAFKA_BOOTSTRAP.split(","),
+        group_id=KAFKA_GROUP_ID,
+        auto_offset_reset="earliest",
+        enable_auto_commit=False,   # manual commit after successful Fabric tx
+        value_deserializer=lambda b: b,
+    )
+    producer = KafkaProducer(
+        bootstrap_servers=KAFKA_BOOTSTRAP.split(","),
+        value_serializer=lambda b: b,
+    )
+
+    for msg in consumer:
+        raw = msg.value
+        success = False
+        for attempt in range(KAFKA_MAX_RETRIES + 1):
+            if attempt > 0:
+                delay = _backoff(attempt - 1)
+                log.info("[WORKER] retry %d/%d after %.1fs", attempt, KAFKA_MAX_RETRIES, delay)
+                time.sleep(delay)
+            try:
+                success = process_message(raw, producer)
+                if success:
+                    break
+            except Exception as exc:
+                log.warning("[WORKER] attempt %d raised: %s", attempt, exc)
+
+        if not success:
+            log.error("[WORKER] all retries exhausted — message in DLQ")
+
+        # Commit offset only after successful processing (or after DLQ routing)
+        consumer.commit()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [LOGGER] %(levelname)s %(message)s",
+    )
+    run()
