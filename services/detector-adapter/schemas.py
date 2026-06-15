@@ -1,9 +1,8 @@
 """Pydantic v2 schemas for the Detector Adapter."""
-import uuid
 from enum import Enum
-from typing import List, Optional
-
+from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
+import uuid
 
 
 class SeverityLevel(str, Enum):
@@ -14,20 +13,28 @@ class SeverityLevel(str, Enum):
     INFO     = "INFO"
 
 
+class CloudProvider(str, Enum):
+    AWS   = "AWS"
+    GCP   = "GCP"
+    AZURE = "Azure"
+    OTHER = "OTHER"
+
+
 class SecurityEventRequest(BaseModel):
-    event_id:             Optional[uuid.UUID] = Field(default_factory=uuid.uuid4)
-    asset_id:             str
-    cloud_provider:       str = ""
-    region:               str = ""
-    severity:             SeverityLevel
-    attack_category:      str = ""
-    description:          str = ""
-    detection_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    model_version:        str = ""
+    event_id:             uuid.UUID        = Field(default_factory=uuid.uuid4)
+    asset_id:             str              = Field(..., min_length=1)
+    cloud_provider:       CloudProvider    = CloudProvider.AWS
+    region:               str              = ""
+    severity:             SeverityLevel    = SeverityLevel.LOW
+    attack_category:      str              = ""
+    description:          str              = ""
+    detection_confidence: float            = Field(default=0.0, ge=0.0, le=1.0)
+    model_version:        str              = "v1.0"
+    raw_payload:          Optional[Dict]   = None
 
 
 class BatchEventRequest(BaseModel):
-    events: List[SecurityEventRequest]
+    events: List[SecurityEventRequest] = Field(..., min_length=1)
 
 
 class EventResponse(BaseModel):
