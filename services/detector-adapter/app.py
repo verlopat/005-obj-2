@@ -1,4 +1,8 @@
-"""Detector Adapter — FastAPI ingestion endpoint publishing events to Kafka."""
+"""Detector Adapter — FastAPI ingestion endpoint publishing events to Kafka.
+
+Now includes a real Isolation Forest anomaly detector (detector.py) that
+replaces hardcoded detection_confidence values with genuine model scores.
+"""
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -19,13 +23,28 @@ logging.basicConfig(level=getattr(logging, config.log_level),
                     format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+# ── Load real anomaly detector ───────────────────────────────────────────────
+try:
+    from detector import detector as _anomaly_detector
+    logger.info("Isolation Forest detector loaded (%s)", _anomaly_detector.model_version())
+except Exception as _det_err:
+    logger.warning("Could not load anomaly detector: %s — using passthrough", _det_err)
+    _anomaly_detector = None
+
+
+def _score_event(event_dict: dict) -> dict:
+    """Enrich event with real model-derived confidence + model version."""
+    if _anomaly_detector is not None:
+        event_dict["detection_confidence"] = _anomaly_detector.score(event_dict)
+        event_dict["model_version"]        = _anomaly_detector.model_version()
+    return event_dict
+
 
 # ── Prometheus metrics — safe against duplicate-registration on hot reload ──
 def _safe_counter(name, doc, labelnames=None):
     try:
         return Counter(name, doc, labelnames or [])
     except ValueError:
-        # Already registered in this process — re-use the existing collector
         from prometheus_client import REGISTRY
         for collector in REGISTRY._names_to_collectors.values():
             if hasattr(collector, '_name') and collector._name in (name, name + '_total'):
@@ -87,12 +106,18 @@ async def health_check():
 async def ingest_event(event: SecurityEventRequest):
     start = time.perf_counter()
     try:
-        producer.produce(str(event.event_id), event.model_dump())
+        event_dict = _score_event(event.model_dump())
+        producer.produce(str(event.event_id), event_dict)
         if EVENTS_PRODUCED is not None:
             EVENTS_PRODUCED.labels(severity=event.severity.value).inc()
         if INGESTION_LAT is not None:
             INGESTION_LAT.observe(time.perf_counter() - start)
-        return EventResponse(event_id=str(event.event_id), status="accepted")
+        return EventResponse(
+            event_id=str(event.event_id),
+            status="accepted",
+            detection_confidence=event_dict.get("detection_confidence"),
+            model_version=event_dict.get("model_version"),
+        )
     except Exception as exc:
         if EVENTS_FAILED is not None:
             EVENTS_FAILED.inc()
@@ -109,10 +134,16 @@ async def ingest_batch(batch: BatchEventRequest):
     results, accepted, rejected = [], 0, 0
     for event in batch.events:
         try:
-            producer.produce(str(event.event_id), event.model_dump())
+            event_dict = _score_event(event.model_dump())
+            producer.produce(str(event.event_id), event_dict)
             if EVENTS_PRODUCED is not None:
                 EVENTS_PRODUCED.labels(severity=event.severity.value).inc()
-            results.append(EventResponse(event_id=str(event.event_id), status="accepted"))
+            results.append(EventResponse(
+                event_id=str(event.event_id),
+                status="accepted",
+                detection_confidence=event_dict.get("detection_confidence"),
+                model_version=event_dict.get("model_version"),
+            ))
             accepted += 1
         except Exception as exc:
             if EVENTS_FAILED is not None:
