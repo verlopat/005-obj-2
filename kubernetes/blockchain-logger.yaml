@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blockchain-logger
+  namespace: fabric-security
+  labels:
+    app: blockchain-logger
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: blockchain-logger
+  template:
+    metadata:
+      labels:
+        app: blockchain-logger
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+    spec:
+      containers:
+        - name: blockchain-logger
+          image: fabric-security/blockchain-logger:1.0.0
+          ports:
+            - containerPort: 9091
+          envFrom:
+            - configMapRef:
+                name: pipeline-config
+          volumeMounts:
+            - name: fabric-certs
+              mountPath: /certs
+              readOnly: true
+            - name: signing-keys
+              mountPath: /certs/signing
+              readOnly: true
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: 2000m
+              memory: 1Gi
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: 9091
+            initialDelaySeconds: 20
+            periodSeconds: 30
+      volumes:
+        - name: fabric-certs
+          secret:
+            secretName: fabric-tls-certs
+        - name: signing-keys
+          secret:
+            secretName: signing-keys
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: blockchain-logger
+  namespace: fabric-security
+spec:
+  selector:
+    app: blockchain-logger
+  ports:
+    - name: metrics
+      port: 9091
+      targetPort: 9091
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: blockchain-logger-hpa
+  namespace: fabric-security
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: blockchain-logger
+  minReplicas: 2
+  maxReplicas: 16
+  metrics:
+    - type: External
+      external:
+        metric:
+          name: kafka_consumer_group_lag
+          selector:
+            matchLabels:
+              group: blockchain-logger-group
+        target:
+          type: AverageValue
+          averageValue: "500"

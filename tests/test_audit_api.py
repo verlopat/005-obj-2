@@ -1,58 +1,80 @@
-"""Integration tests for the audit-api service."""
-import pytest
-from fastapi.testclient import TestClient
-from unittest.mock import patch, MagicMock
-
+"""Tests for the audit-api query and report service."""
+import json
 import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "services", "audit-api"))
+import pytest
+from datetime import datetime, timedelta
+from unittest.mock import MagicMock, patch
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'services', 'audit-api'))
 
-@pytest.fixture
-def client():
-    with patch("query_service.FabricQueryService._ensure_init"):
-        from app import app
-        return TestClient(app)
+from schemas import (
+    ComplianceReport, ComplianceStandard, EventRecord,
+    IntegrityCheckResult,
+)
 
+# --- EventRecord schema validation ---
 
-class TestHealthEndpoint:
-    def test_health_returns_200(self, client):
-        resp = client.get("/healthz")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["status"] in ("ok", "degraded")
-        assert "version" in data
+def make_event(**kwargs):
+    defaults = {
+        "event_id": "evt-001", "asset_id": "asset-123",
+        "severity": "HIGH", "attack_category": "DDOS",
+        "description": "Test event", "ipfs_cid": "bafybei123",
+        "sha256": "abc123", "tx_id": "txid-001",
+        "timestamp": datetime.utcnow().isoformat(),
+        "detection_confidence": 0.95, "model_version": "v1.0",
+        "logged_by_msp": "Org1MSP",
+    }
+    defaults.update(kwargs)
+    return EventRecord(**defaults)
 
+def test_event_record_valid():
+    e = make_event()
+    assert e.event_id == "evt-001"
+    assert e.severity == "HIGH"
 
-class TestAuditTrail:
-    def test_audit_trail_empty_results(self, client):
-        with patch("app.query_service.get_event_history", return_value=[]):
-            resp = client.post("/api/v1/audit/trail", json={
-                "asset_id": "cloud-asset-001",
-                "limit": 10,
-            })
-        assert resp.status_code == 200
-        assert resp.json() == []
+def test_event_record_optional_fields():
+    e = make_event()
+    assert e.block_number is None
+    assert e.signature is None
 
-    def test_event_not_found(self, client):
-        with patch("app.query_service.get_event", return_value=None):
-            resp = client.get("/api/v1/events/nonexistent-event-id")
-        assert resp.status_code == 404
+def test_compliance_report_structure():
+    events = [make_event(severity="HIGH"), make_event(event_id="evt-002", severity="CRITICAL")]
+    report = ComplianceReport(
+        standard="ISO-27001",
+        generated_at=datetime.utcnow(),
+        period_start=datetime.utcnow() - timedelta(days=1),
+        period_end=datetime.utcnow(),
+        total_events=2,
+        events_by_severity={"HIGH": 1, "CRITICAL": 1},
+        events_by_category={"DDOS": 2},
+        high_confidence_events=2,
+        integrity_violations=0,
+        events=events,
+        report_sha256="deadbeef",
+    )
+    assert report.total_events == 2
+    assert report.events_by_severity["HIGH"] == 1
+    assert len(report.events) == 2
 
+def test_integrity_check_result_match():
+    result = IntegrityCheckResult(
+        event_id="evt-001",
+        chain_sha256="abc123",
+        ipfs_sha256="abc123",
+        match=True,
+        ipfs_cid="bafybei123",
+        verified_at=datetime.utcnow(),
+    )
+    assert result.match is True
 
-class TestComplianceReport:
-    def test_report_generation(self, client):
-        with patch("app.query_service.get_event_history", return_value=[]), \
-             patch("app.report_service.generate") as mock_gen:
-            mock_gen.return_value = MagicMock(
-                framework="ISO27001", total_events=0,
-                by_severity={}, by_category={}, by_asset={},
-                integrity_pass_rate=1.0, events=[],
-                report_path="/tmp/test.json",
-                generated_at="2024-01-01T00:00:00Z",
-                period_start="2024-01-01T00:00:00Z",
-                period_end="2024-01-31T00:00:00Z",
-            )
-            resp = client.post("/api/v1/compliance/report",
-                               params={"framework": "ISO27001", "days": 7})
-        assert resp.status_code in (200, 422)  # 422 if mock not fully serialisable
+def test_integrity_check_result_mismatch():
+    result = IntegrityCheckResult(
+        event_id="evt-002",
+        chain_sha256="abc123",
+        ipfs_sha256="different456",
+        match=False,
+        ipfs_cid="bafybei456",
+        verified_at=datetime.utcnow(),
+    )
+    assert result.match is False

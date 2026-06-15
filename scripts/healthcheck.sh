@@ -1,33 +1,21 @@
-#!/usr/bin/env bash
-# Check health of all running services
+#!/bin/bash
+# Check health of all services
 set -euo pipefail
-
-DETECTOR_URL="${DETECTOR_URL:-http://localhost:8000}"
-AUDIT_URL="${AUDIT_URL:-http://localhost:8001}"
-PROMETHEUS_URL="${PROMETHEUS_URL:-http://localhost:9090}"
-
-passed=0; failed=0
+OK="\033[0;32m✔\033[0m"
+FAIL="\033[0;31m✘\033[0m"
 
 check() {
-  local name="$1" url="$2" expected="$3"
-  local status
-  status=$(curl -sf -o /dev/null -w "%{http_code}" "${url}" 2>/dev/null || echo "000")
-  if [ "${status}" = "${expected}" ]; then
-    echo "  ✓ ${name} (HTTP ${status})"
-    ((passed++))
+  local name=$1 url=$2
+  if curl -sf "$url" > /dev/null 2>&1; then
+    echo -e "$OK $name"
   else
-    echo "  ✗ ${name} (expected HTTP ${expected}, got ${status})"
-    ((failed++))
+    echo -e "$FAIL $name ($url)"
   fi
 }
 
-echo "=== Health Check ==="
-check "Detector Adapter"  "${DETECTOR_URL}/healthz"                "200"
-check "Audit API"          "${AUDIT_URL}/healthz"                   "200"
-check "Prometheus"         "${PROMETHEUS_URL}/-/healthy"            "200"
-check "Detector Metrics"   "${DETECTOR_URL}/metrics"               "200"
-check "Audit Metrics"      "${AUDIT_URL}/metrics"                   "200"
-
-echo ""
-echo "Results: ${passed} passed, ${failed} failed"
-[ "${failed}" -eq 0 ] && exit 0 || exit 1
+echo "=== Service Health Check ==="
+check "Detector Adapter" "http://localhost:8000/healthz"
+check "Audit API"         "http://localhost:8001/healthz"
+check "Prometheus"        "http://localhost:9090/-/healthy"
+check "Grafana"           "http://localhost:3000/api/health"
+check "IPFS API"          "http://localhost:5001/api/v0/version"

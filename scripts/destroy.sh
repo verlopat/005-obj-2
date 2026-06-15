@@ -1,16 +1,11 @@
-#!/usr/bin/env bash
-# Tear down the dev stack and clean generated artifacts
+#!/bin/bash
+# Tear down the full stack and clean up volumes
 set -euo pipefail
-
-BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.."
-echo "Destroying 005-obj-2 dev stack..."
-
-docker compose -f "${BASE_DIR}/docker-compose.yml" down -v --remove-orphans 2>/dev/null || true
-
-rm -rf \
-  "${BASE_DIR}/crypto-config" \
-  "${BASE_DIR}/genesis.block" \
-  "${BASE_DIR}/channel.tx" \
-  "${BASE_DIR}/results/"
-
-echo "Stack destroyed and artifacts removed."
+log() { echo -e "\033[0;33m[DESTROY]\033[0m $*"; }
+log "Stopping all services..."
+docker-compose down -v --remove-orphans 2>/dev/null || true
+log "Removing generated crypto materials..."
+rm -rf crypto-config/ channel-artifacts/ reports/
+log "Removing dangling volumes..."
+docker volume prune -f
+log "Stack destroyed."

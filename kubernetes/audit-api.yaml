@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: audit-api
+  namespace: fabric-security
+  labels:
+    app: audit-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: audit-api
+  template:
+    metadata:
+      labels:
+        app: audit-api
+    spec:
+      containers:
+        - name: audit-api
+          image: fabric-security/audit-api:1.0.0
+          ports:
+            - containerPort: 8001
+          envFrom:
+            - configMapRef:
+                name: pipeline-config
+          volumeMounts:
+            - name: fabric-certs
+              mountPath: /certs
+              readOnly: true
+            - name: reports
+              mountPath: /app/reports
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8001
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: fabric-certs
+          secret:
+            secretName: fabric-tls-certs
+        - name: reports
+          persistentVolumeClaim:
+            claimName: reports-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: audit-api
+  namespace: fabric-security
+spec:
+  selector:
+    app: audit-api
+  ports:
+    - name: http
+      port: 8001
+      targetPort: 8001
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: reports-pvc
+  namespace: fabric-security
+spec:
+  accessModes: [ReadWriteMany]
+  resources:
+    requests:
+      storage: 10Gi
