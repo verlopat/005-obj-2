@@ -1,0 +1,36 @@
+# Kafka broker tuning for the security event pipeline
+# Apply via: kafka-configs.sh --bootstrap-server <broker> --entity-type brokers --alter
+
+broker_config:
+  # Durability
+  default.replication.factor: 1           # increase to 3 in production
+  min.insync.replicas: 1                  # increase to 2 in production
+  unclean.leader.election.enable: "false"
+
+  # Performance
+  num.io.threads: 8
+  num.network.threads: 4
+  socket.send.buffer.bytes: 102400
+  socket.receive.buffer.bytes: 102400
+  socket.request.max.bytes: 104857600
+  num.partitions: 12
+  log.retention.hours: 168               # 7 days
+  log.segment.bytes: 1073741824          # 1 GB
+  log.retention.check.interval.ms: 300000
+
+  # Compression
+  compression.type: gzip
+
+topic_defaults:
+  security-events:
+    partitions: 12
+    replication-factor: 1
+    config:
+      retention.ms: 604800000
+      max.message.bytes: 10485760        # 10 MB
+      message.timestamp.type: CreateTime
+  security-events-dlq:
+    partitions: 3
+    replication-factor: 1
+    config:
+      retention.ms: 2592000000

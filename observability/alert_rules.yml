@@ -1,0 +1,75 @@
+groups:
+  - name: security_pipeline
+    interval: 30s
+    rules:
+      # Detector Adapter alerts
+      - alert: DetectorHighErrorRate
+        expr: rate(detector_events_failed_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Detector adapter error rate is high"
+          description: "{{ $value | humanize }} events/s failing to reach Kafka"
+
+      - alert: DetectorDown
+        expr: up{job="detector-adapter"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Detector adapter is down"
+
+      # Blockchain Logger alerts
+      - alert: BlockchainLoggerHighLatency
+        expr: histogram_quantile(0.95, rate(logger_event_log_latency_seconds_bucket[5m])) > 5
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Blockchain logger P95 latency > 5s"
+          description: "P95 latency is {{ $value | humanizeDuration }}"
+
+      - alert: BlockchainLoggerFabricFailures
+        expr: rate(logger_events_failed_total{reason="fabric"}[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Fabric submission failures detected"
+
+      - alert: BlockchainLoggerIPFSFailures
+        expr: rate(logger_events_failed_total{reason="ipfs"}[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "IPFS upload failures detected"
+
+      # Kafka alerts
+      - alert: KafkaConsumerLagHigh
+        expr: logger_consumer_lag > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka consumer lag is high"
+          description: "Consumer lag: {{ $value }} messages"
+
+      # Audit API alerts
+      - alert: AuditAPIDown
+        expr: up{job="audit-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Audit API is unreachable"
+
+      # Fabric peer alerts
+      - alert: FabricPeerDown
+        expr: up{job="fabric-peer"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Fabric peer is down"

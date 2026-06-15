@@ -1,0 +1,48 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    project: "005-obj-2"
+    environment: "dev"
+
+rule_files:
+  - "alert_rules.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - "alertmanager:9093"
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: "detector-adapter"
+    static_configs:
+      - targets: ["detector-adapter:9090"]
+    metrics_path: "/metrics"
+
+  - job_name: "blockchain-logger"
+    static_configs:
+      - targets: ["blockchain-logger:9091"]
+    metrics_path: "/metrics"
+
+  - job_name: "audit-api"
+    static_configs:
+      - targets: ["audit-api:9092"]
+    metrics_path: "/metrics"
+
+  - job_name: "compliance-scheduler"
+    static_configs:
+      - targets: ["compliance-scheduler:9093"]
+    metrics_path: "/metrics"
+
+  - job_name: "fabric-peer"
+    static_configs:
+      - targets: ["peer0-org1:9443"]
+
+  - job_name: "kafka"
+    static_configs:
+      - targets: ["kafka-exporter:9308"]

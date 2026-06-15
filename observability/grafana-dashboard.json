@@ -1,0 +1,92 @@
+{
+  "title": "Security Event Pipeline",
+  "uid": "sec-pipeline-001",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-3h", "to": "now"},
+  "tags": ["security", "blockchain", "kafka"],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Events/s (Ingest)",
+      "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
+      "targets": [{
+        "expr": "sum(rate(detector_events_produced_total[1m]))",
+        "legendFormat": "Events/s"
+      }]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Blockchain Logged/s",
+      "gridPos": {"x": 6, "y": 0, "w": 6, "h": 4},
+      "targets": [{
+        "expr": "sum(rate(logger_events_logged_total[1m]))",
+        "legendFormat": "Logged/s"
+      }]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Consumer Lag",
+      "gridPos": {"x": 12, "y": 0, "w": 6, "h": 4},
+      "targets": [{
+        "expr": "logger_consumer_lag",
+        "legendFormat": "Lag"
+      }]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Error Rate",
+      "gridPos": {"x": 18, "y": 0, "w": 6, "h": 4},
+      "targets": [{
+        "expr": "sum(rate(logger_events_failed_total[1m]))",
+        "legendFormat": "Failures/s"
+      }]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "End-to-End Latency (P50/P95/P99)",
+      "gridPos": {"x": 0, "y": 4, "w": 12, "h": 8},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, rate(logger_event_log_latency_seconds_bucket[5m]))", "legendFormat": "P50"},
+        {"expr": "histogram_quantile(0.95, rate(logger_event_log_latency_seconds_bucket[5m]))", "legendFormat": "P95"},
+        {"expr": "histogram_quantile(0.99, rate(logger_event_log_latency_seconds_bucket[5m]))", "legendFormat": "P99"}
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Events by Severity",
+      "gridPos": {"x": 12, "y": 4, "w": 12, "h": 8},
+      "targets": [{
+        "expr": "sum by (severity) (rate(detector_events_produced_total[1m]))",
+        "legendFormat": "{{severity}}"
+      }]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Failure Breakdown by Reason",
+      "gridPos": {"x": 0, "y": 12, "w": 12, "h": 8},
+      "targets": [{
+        "expr": "sum by (reason) (rate(logger_events_failed_total[5m]))",
+        "legendFormat": "{{reason}}"
+      }]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Audit API Query Latency",
+      "gridPos": {"x": 12, "y": 12, "w": 12, "h": 8},
+      "targets": [
+        {"expr": "histogram_quantile(0.95, rate(audit_query_latency_seconds_bucket[5m]))", "legendFormat": "P95"},
+        {"expr": "histogram_quantile(0.50, rate(audit_query_latency_seconds_bucket[5m]))", "legendFormat": "P50"}
+      ]
+    }
+  ]
+}
