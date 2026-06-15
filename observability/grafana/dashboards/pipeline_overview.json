@@ -1,0 +1,59 @@
+{
+  "title": "Security Event Pipeline Overview",
+  "uid": "security-pipeline-overview",
+  "tags": ["security", "fabric", "kafka"],
+  "refresh": "30s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Events Ingested / sec",
+      "type": "stat",
+      "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
+      "targets": [{"expr": "sum(rate(detector_events_produced_total[5m]))", "legendFormat": "Events/sec"}]
+    },
+    {
+      "id": 2,
+      "title": "Events Logged to Blockchain / sec",
+      "type": "stat",
+      "gridPos": {"x": 6, "y": 0, "w": 6, "h": 4},
+      "targets": [{"expr": "sum(rate(logger_events_logged_total[5m]))", "legendFormat": "Logged/sec"}]
+    },
+    {
+      "id": 3,
+      "title": "P95 Log Latency (Kafka to Chain)",
+      "type": "stat",
+      "gridPos": {"x": 12, "y": 0, "w": 6, "h": 4},
+      "targets": [{"expr": "histogram_quantile(0.95, sum(rate(logger_event_log_latency_seconds_bucket[5m])) by (le))", "legendFormat": "P95 latency"}]
+    },
+    {
+      "id": 4,
+      "title": "Consumer Lag (blockchain-logger-group)",
+      "type": "stat",
+      "gridPos": {"x": 18, "y": 0, "w": 6, "h": 4},
+      "targets": [{"expr": "sum(kafka_consumer_group_lag{group=\"blockchain-logger-group\"})", "legendFormat": "Lag"}]
+    },
+    {
+      "id": 5,
+      "title": "Events by Severity Over Time",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 4, "w": 12, "h": 8},
+      "targets": [
+        {"expr": "rate(detector_events_produced_total{severity=\"CRITICAL\"}[5m])", "legendFormat": "CRITICAL"},
+        {"expr": "rate(detector_events_produced_total{severity=\"HIGH\"}[5m])", "legendFormat": "HIGH"},
+        {"expr": "rate(detector_events_produced_total{severity=\"MEDIUM\"}[5m])", "legendFormat": "MEDIUM"},
+        {"expr": "rate(detector_events_produced_total{severity=\"LOW\"}[5m])", "legendFormat": "LOW"}
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Failure Rates by Stage",
+      "type": "timeseries",
+      "gridPos": {"x": 12, "y": 4, "w": 12, "h": 8},
+      "targets": [
+        {"expr": "rate(detector_events_failed_total[5m])", "legendFormat": "Ingestion"},
+        {"expr": "rate(logger_events_failed_total{reason=\"fabric\"}[5m])", "legendFormat": "Fabric"},
+        {"expr": "rate(logger_events_failed_total{reason=\"ipfs\"}[5m])", "legendFormat": "IPFS"}
+      ]
+    }
+  ]
+}

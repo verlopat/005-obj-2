@@ -1,52 +1,59 @@
-"""Estimate on-chain vs off-chain storage usage and per-event byte cost."""
+"""Estimate Hyperledger Fabric blockchain storage growth for security events."""
 import json
-import sys
+from dataclasses import dataclass, asdict
+from typing import List
 
-# Approximate sizes (bytes)
-ON_CHAIN_FIELDS = {
-    "event_id":             36,
-    "asset_id":             64,
-    "severity":             8,
-    "attack_category":      20,
-    "description_truncated":128,
-    "ipfs_cid":             59,   # CIDv1 base32 ~ 59 chars
-    "sha256":               64,
-    "tx_id":                64,
-    "detection_confidence":  8,
-    "model_version":        8,
-    "signature_b64":        96,   # ECDSA P-256 DER ~72 bytes, base64 ~96
-    "timestamp":            24,
-    "metadata_overhead":    200,  # Fabric key, namespace, version, metadata
-}
+@dataclass
+class StorageEstimate:
+    events_per_day: int
+    avg_event_size_bytes: int
+    avg_ipfs_payload_bytes: int
+    days: int
+    replication_factor: int = 3
+    couchdb_overhead_multiplier: float = 3.0
+    leveldb_overhead_multiplier: float = 1.5
 
-OFF_CHAIN_RAW_PAYLOAD = 4096   # max raw payload size stored in IPFS
-IPFS_BLOCK_OVERHEAD   = 256
+    @property
+    def total_events(self) -> int:
+        return self.events_per_day * self.days
 
+    @property
+    def raw_ledger_bytes(self) -> int:
+        return self.total_events * self.avg_event_size_bytes
 
-def compute_costs(num_events: int = 1_000_000) -> None:
-    on_chain_bytes  = sum(ON_CHAIN_FIELDS.values())
-    off_chain_bytes = OFF_CHAIN_RAW_PAYLOAD + IPFS_BLOCK_OVERHEAD
-    total_on_chain  = on_chain_bytes  * num_events
-    total_off_chain = off_chain_bytes * num_events
+    @property
+    def replicated_ledger_bytes(self) -> int:
+        return self.raw_ledger_bytes * self.replication_factor
 
-    results = {
-        "per_event": {
-            "on_chain_bytes":  on_chain_bytes,
-            "off_chain_bytes": off_chain_bytes,
-            "total_bytes":     on_chain_bytes + off_chain_bytes,
-        },
-        f"{num_events:,}_events": {
-            "on_chain_MB":  round(total_on_chain  / 1e6, 2),
-            "off_chain_MB": round(total_off_chain / 1e6, 2),
-            "total_MB":     round((total_on_chain + total_off_chain) / 1e6, 2),
-            "on_chain_GB":  round(total_on_chain  / 1e9, 4),
-            "off_chain_GB": round(total_off_chain / 1e9, 4),
-        },
-        "on_chain_field_breakdown": ON_CHAIN_FIELDS,
-    }
-    print(json.dumps(results, indent=2))
+    @property
+    def couchdb_state_db_bytes(self) -> int:
+        return int(self.raw_ledger_bytes * self.couchdb_overhead_multiplier)
 
+    @property
+    def ipfs_storage_bytes(self) -> int:
+        return self.total_events * self.avg_ipfs_payload_bytes
+
+    @property
+    def total_storage_bytes(self) -> int:
+        return self.replicated_ledger_bytes + self.couchdb_state_db_bytes + self.ipfs_storage_bytes
+
+    def summary(self) -> dict:
+        def fmt_gb(b): return round(b / 1e9, 3)
+        return {
+            "scenario": f"{self.events_per_day:,} events/day x {self.days} days",
+            "total_events": f"{self.total_events:,}",
+            "ledger_per_peer_gb": fmt_gb(self.raw_ledger_bytes),
+            "ledger_replicated_gb": fmt_gb(self.replicated_ledger_bytes),
+            "couchdb_state_db_gb": fmt_gb(self.couchdb_state_db_bytes),
+            "ipfs_storage_gb": fmt_gb(self.ipfs_storage_bytes),
+            "total_storage_gb": fmt_gb(self.total_storage_bytes),
+        }
 
 if __name__ == "__main__":
-    n = int(sys.argv[1]) if len(sys.argv) > 1 else 1_000_000
-    compute_costs(n)
+    scenarios = [
+        StorageEstimate(events_per_day=10_000,  avg_event_size_bytes=2048, avg_ipfs_payload_bytes=4096, days=30),
+        StorageEstimate(events_per_day=100_000, avg_event_size_bytes=2048, avg_ipfs_payload_bytes=4096, days=30),
+        StorageEstimate(events_per_day=1_000_000, avg_event_size_bytes=2048, avg_ipfs_payload_bytes=4096, days=30),
+        StorageEstimate(events_per_day=100_000, avg_event_size_bytes=2048, avg_ipfs_payload_bytes=4096, days=365),
+    ]
+    print(json.dumps([s.summary() for s in scenarios], indent=2))

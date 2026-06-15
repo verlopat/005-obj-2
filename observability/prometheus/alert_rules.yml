@@ -1,0 +1,57 @@
+groups:
+  - name: security_pipeline
+    interval: 30s
+    rules:
+      - alert: HighEventIngestionFailureRate
+        expr: rate(detector_events_failed_total[5m]) / rate(detector_events_produced_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High event ingestion failure rate (>5%)"
+          description: "Detector adapter failure rate is {{ $value | humanizePercentage }}"
+
+      - alert: BlockchainLoggerConsumerLag
+        expr: kafka_consumer_group_lag{group="blockchain-logger-group"} > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Blockchain logger consumer lag is high"
+          description: "Consumer lag is {{ $value }} messages"
+
+      - alert: FabricSubmissionFailures
+        expr: rate(logger_events_failed_total{reason="fabric"}[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Fabric submission failures detected"
+          description: "Fabric failure rate: {{ $value }} events/sec"
+
+      - alert: IPFSUploadFailures
+        expr: rate(logger_events_failed_total{reason="ipfs"}[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "IPFS upload failures detected"
+          description: "IPFS failure rate: {{ $value }} events/sec"
+
+      - alert: HighEventLogLatency
+        expr: histogram_quantile(0.95, rate(logger_event_log_latency_seconds_bucket[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P95 event log latency > 5s"
+          description: "P95 latency is {{ $value }}s"
+
+      - alert: CriticalSeverityEventSpike
+        expr: rate(detector_events_produced_total{severity="CRITICAL"}[5m]) > 10
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Spike in CRITICAL severity events"
+          description: "{{ $value }} CRITICAL events/sec in last 5m"
