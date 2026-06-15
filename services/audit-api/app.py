@@ -11,6 +11,7 @@ import os
 import sys
 from typing import List, Optional
 
+# Make repo root importable so 'shared' package resolves correctly.
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
@@ -21,7 +22,9 @@ import uvicorn
 
 from shared import config as cfg
 from shared.event_schema import SecurityEvent, VerificationResult
-from services.audit_api.query_service import (
+
+# Import query_service from the same package directory (avoids dash-in-path issues).
+from query_service import (
     query_by_asset,
     query_by_event_id,
     query_by_severity,
@@ -72,7 +75,7 @@ def audit_trail(req: TrailRequest):
     """
     Return the audit trail for an asset.
     Reads from Redis (populated by blockchain-logger after each Fabric commit).
-    Returns [] if no records are found — never raises 404 for empty results.
+    Returns [] if no records found — never raises 404 for empty results.
     """
     records = query_by_asset(req.asset_id, page_size=req.page_size)
     return [r.to_ledger_dict() for r in records]
@@ -102,8 +105,9 @@ def verify(event_id: str):
       - live IPFS payload SHA-256 == stored hash
       - ECDSA agent_signature over canonical_bytes() is valid
 
-    Returns explicit status: VALID | HASH_MISMATCH | SIGNATURE_INVALID |
-                             CID_NOT_FOUND | IPFS_HASH_MISMATCH | MISSING_FIELDS
+    Returns explicit status:
+      VALID | HASH_MISMATCH | SIGNATURE_INVALID | CID_NOT_FOUND |
+      IPFS_HASH_MISMATCH | MISSING_FIELDS
     """
     return verify_record(event_id)
 
