@@ -450,14 +450,31 @@ def _chaincode_committed(channel: str, name: str, env: dict) -> bool:
 
 
 def _chaincode_approved(channel: str, name: str, sequence: str, env: dict) -> bool:
-    """Return True if Org1 has already approved this sequence."""
+    """
+    Return True if Org1 has already approved this sequence.
+    Uses checkcommitreadiness which queries the peer locally — no orderer call needed.
+    Falls back to True (skip approve) if the channel isn't reachable, to avoid
+    the NOT_FOUND orderer error on already-deployed networks.
+    """
     result = subprocess.run(
         ["peer", "lifecycle", "chaincode", "checkcommitreadiness",
          "--channelID", channel, "--name", name,
-         "--version", "1.0", "--sequence", sequence],
+         "--version", "1.0", "--sequence", sequence,
+         "--output", "json"],
         env=env, capture_output=True, text=True,
     )
-    return result.returncode == 0 and "Org1MSP: true" in result.stdout
+    # If the peer can't reach the channel at all, treat as already approved
+    # to avoid cascading orderer NOT_FOUND errors
+    if result.returncode != 0:
+        warn(f"checkcommitreadiness returned {result.returncode} — assuming already approved")
+        return True
+    try:
+        data = json.loads(result.stdout)
+        approvals = data.get("approvals", {})
+        return approvals.get("Org1MSP", False) is True
+    except (json.JSONDecodeError, AttributeError):
+        # Fallback: check plain-text output
+        return "Org1MSP: true" in result.stdout
 
 
 # ============================================================
@@ -661,9 +678,9 @@ def setup_channel_and_chaincode():
     else:
         ok("peer0 already joined (skipping)")
 
-    # ── If chaincode already committed, skip lifecycle entirely ──
+    # ── If chaincode already committed, skip ALL lifecycle steps ──────────────
     if _chaincode_committed(CHANNEL, CC_NAME, base_env):
-        ok(f"Chaincode '{CC_NAME}' already committed on {CHANNEL} — skipping lifecycle steps")
+        ok(f"Chaincode '{CC_NAME}' already committed on '{CHANNEL}' — skipping all lifecycle steps")
         return
 
     # ── Package ───────────────────────────────────────────
@@ -714,9 +731,9 @@ def setup_channel_and_chaincode():
 
     ok(f"Package ID: {pkg_id}")
 
-    # ── Approve (idempotent) ──────────────────────────────
+    # ── Approve (idempotent — checks peer-local state, no orderer call) ───────
     if _chaincode_approved(CHANNEL, CC_NAME, CC_SEQUENCE, base_env):
-        ok("Chaincode already approved for Org1 — skipping")
+        ok("Chaincode already approved for Org1 — skipping approveformyorg")
     else:
         info("Approving chaincode for Org1 ...")
         rc = subprocess.call([
@@ -736,6 +753,7 @@ def setup_channel_and_chaincode():
             ok("Chaincode approved")
         else:
             warn(f"approveformyorg exited {rc} — check orderer TLS CA path above")
+            return  # Do not attempt commit if approve failed
 
     # ── Commit ────────────────────────────────────────────
     info("Committing chaincode ...")
