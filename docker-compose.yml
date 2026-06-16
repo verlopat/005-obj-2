@@ -1,4 +1,4 @@
-# Objective 2 — Full stack: Fabric CA, Orderer, 2x Peers, 2x CouchDB, IPFS, Kafka (Redpanda)
+# Objective 2 — Full stack: Fabric CA, Orderer, 2x Peers, 2x CouchDB, IPFS, Kafka (Redpanda), Redis
 # 'version' key removed (obsolete in Compose v2+)
 
 services:
@@ -47,6 +47,26 @@ services:
         rpk topic create security-events --brokers=redpanda:29092 --partitions=4 --replicas=1
         rpk topic create security-events-dlq --brokers=redpanda:29092 --partitions=1 --replicas=1
         echo "Topics created"
+
+  # ─────────────────────────────────────────────────────────────
+  # Redis — audit index / event cache
+  # ─────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    container_name: redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - fabric-network
 
   # ─────────────────────────────────────────────────────────────
   # Fabric CA
@@ -239,6 +259,7 @@ volumes:
   couchdb1-data:      # peer1 world state (CouchDB)
   ipfs-data:
   redpanda-data:      # Kafka topic data
+  redis-data:         # Redis AOF persistence
 
 networks:
   fabric-network:
