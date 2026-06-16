@@ -168,15 +168,8 @@ def _venv_python_path() -> Path:
     return VENV_DIR / "bin" / "python3"
 
 
-def _venv_pip_path() -> Path:
-    for name in ("pip3", "pip"):
-        candidate = VENV_DIR / "bin" / name
-        if candidate.exists():
-            return candidate
-    win = VENV_DIR / "Scripts" / "pip.exe"
-    if win.exists():
-        return win
-    return VENV_DIR / "bin" / "pip3"
+# NOTE: _venv_pip_path() was removed — all pip calls use "python -m pip" instead
+# (the pip binary symlink is not guaranteed to exist on all Python versions).
 
 
 def _make_venv():
@@ -277,8 +270,15 @@ def find_fabric_cfg_path() -> str:
         Path(__file__).parent / "fabric-samples" / "config",
         Path.home() / "fabric-samples" / "config",
         Path.home() / "go" / "src" / "github.com" / "hyperledger" / "fabric-samples" / "config",
-        Path(os.environ.get("FABRIC_CFG_PATH", "")),
     ]
+
+    # Only add the env var candidate when FABRIC_CFG_PATH is actually set.
+    # An empty string would resolve to Path("") == cwd and could give a false
+    # positive if core.yaml happens to exist there for an unrelated reason.
+    env_cfg = os.environ.get("FABRIC_CFG_PATH", "").strip()
+    if env_cfg:
+        candidates.append(Path(env_cfg))
+
     for c in candidates:
         if c and (c / "core.yaml").exists():
             return str(c)
@@ -791,8 +791,10 @@ def start_docker_stack():
     result = subprocess.check_output(
         ["docker", "compose", "ps", "--format", "json"], text=True
     ).strip()
+    # docker compose ps --format json outputs one JSON object per line (JSONL),
+    # NOT a JSON array.  Parse each line individually.
     try:
-        services = json.loads(f"[{result.replace(chr(10), ',')}]") if result else []
+        services = [json.loads(line) for line in result.splitlines() if line.strip()]
     except Exception:
         services = []
     running = [
@@ -848,7 +850,7 @@ def setup_channel_and_chaincode():
         "CORE_PEER_TLS_ROOTCERT_FILE": peer_tls_ca,
     }
 
-    # ── 1. Orderer-aware channel create ────────────────────────────────────
+    # ── 1. Orderer-aware channel create ────────────────────────────────────────
     block = Path(f"channel-artifacts/{CHANNEL}.block")
     force_rejoin = False
 
@@ -1068,6 +1070,12 @@ def start_services():
     if fabric_bin:
         ok(f"FABRIC_BIN_DIR injected for child processes: {fabric_bin}")
 
+    # Inject BLOCKCHAIN_LOGGER_REPO_ROOT so blockchain-logger/app.py can
+    # anchor all relative cert/key paths correctly regardless of cwd.
+    repo_root = str(Path(__file__).parent.resolve())
+    os.environ["BLOCKCHAIN_LOGGER_REPO_ROOT"] = repo_root
+    info(f"BLOCKCHAIN_LOGGER_REPO_ROOT set to: {repo_root}")
+
     procs = []
     for name, script, health in _SERVICES:
         script_path = Path(script)
@@ -1078,8 +1086,9 @@ def start_services():
         log_path.parent.mkdir(exist_ok=True)
         log_fh   = open(log_path, "w")
         svc_dir  = str(script_path.parent.resolve())
-        # Pass the current os.environ (which now includes FABRIC_BIN_DIR
-        # and the updated PATH) explicitly so the child inherits everything.
+        # Pass the current os.environ (which now includes FABRIC_BIN_DIR,
+        # BLOCKCHAIN_LOGGER_REPO_ROOT, and the updated PATH) explicitly so
+        # the child inherits everything.
         p = subprocess.Popen(
             [venv_python, "app.py"],
             cwd=svc_dir,
