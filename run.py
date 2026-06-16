@@ -578,7 +578,7 @@ def _generate_agent_keypair():
     cert_path = Path("crypto-config/agent/signcerts/agent.pem")
 
     if key_path.exists() and cert_path.exists():
-        ok("Agent keypair already exists — skipping")
+        ok("Agent keypair already exists \u2014 skipping")
         return
 
     info("Generating agent EC keypair (P-256) ...")
@@ -634,7 +634,7 @@ def _generate_agent_keypair():
     cert_path.parent.mkdir(parents=True, exist_ok=True)
     cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
 
-    ok(f"Agent keypair written → {key_path}  /  {cert_path}")
+    ok(f"Agent keypair written \u2192 {key_path}  /  {cert_path}")
 
 
 # ============================================================
@@ -770,14 +770,6 @@ def setup_channel_and_chaincode():
     }
 
     # ── 1. Orderer-aware channel create ────────────────────────────────────
-    #
-    # Three states we handle:
-    #   A) Fresh run: no block file, orderer clean  → create + join
-    #   B) Stale run: block file exists, orderer clean (volumes wiped)
-    #                → wipe peer ledger, delete stale block, create + join
-    #   C) Normal re-run: block file exists, orderer has channel
-    #                → skip create; verify peer is properly joined
-    #
     block = Path(f"channel-artifacts/{CHANNEL}.block")
     force_rejoin = False
 
@@ -785,18 +777,9 @@ def setup_channel_and_chaincode():
         if not _channel_exists_on_orderer(CHANNEL, ORDERER_ADDR, orderer_tls, base_env):
             warn(f"{CHANNEL}.block exists locally but orderer has no record of channel.")
             warn("Deleting stale block and recreating channel on fresh orderer ...")
-
-            # ── KEY FIX: wipe peer ledger BEFORE creating new channel ──────
-            # The peer's /var/hyperledger/production still holds block 0 from
-            # the previous orderer run.  If we create the channel first and
-            # the peer tries to gossip/deliver block 1, it will panic with
-            # "unexpected Previous block hash" because block 0 on disk was
-            # written by a different orderer.  Removing the volume first
-            # ensures the peer starts with a clean slate.
             _reset_peer_ledger("peer0.org1.example.com")
-
             block.unlink()
-            force_rejoin = True  # peer ledger cleared; must rejoin
+            force_rejoin = True
 
     if not block.exists():
         info("Creating channel ...")
@@ -813,22 +796,10 @@ def setup_channel_and_chaincode():
     else:
         ok(f"{CHANNEL}.block exists and orderer confirms channel \u2014 skipping create")
 
-    # ── 2. Wait for peer TCP port to be reachable ──────────────────────────
-    #
-    # After _reset_peer_ledger the container is freshly started.  We must
-    # wait until :7051 actually accepts TCP connections before running any
-    # `peer channel` command, otherwise we get "connection refused".
-    #
     if not _wait_for_peer_port("peer0.org1.example.com", 7051, timeout=60):
-        err("peer0:7051 did not become reachable within 60 s — check container logs")
+        err("peer0:7051 did not become reachable within 60 s \u2014 check container logs")
         sys.exit(1)
 
-    # ── 3. Join peer (force-rejoin if we just recreated the channel) ───────
-    #
-    # When force_rejoin=True the peer's in-memory channel list may still show
-    # the old (stale) channel entry, so we skip _channel_exists() and always
-    # call `peer channel join` with the fresh block.
-    #
     already_joined = (not force_rejoin) and _channel_exists(CHANNEL, base_env)
 
     if already_joined:
@@ -848,23 +819,14 @@ def setup_channel_and_chaincode():
             err(f"peer channel join failed (rc={rc}) \u2014 cannot continue")
             sys.exit(1)
 
-    # ── 4. Wait for peer deliver stream to be ready ────────────────────────
-    #
-    # approveformyorg uses the peer's deliver service internally.  If the peer
-    # ledger hasn't finished syncing block 0 from the orderer yet, it returns
-    # EOF on the deliver stream — even though the channel join returned 0.
-    # We poll `peer channel getinfo` until it succeeds before continuing.
-    #
     if not _peer_ledger_synced(CHANNEL, ORDERER_ADDR, orderer_tls, base_env, timeout=90):
-        err("Peer ledger did not sync within 90 s — check peer0 container logs")
+        err("Peer ledger did not sync within 90 s \u2014 check peer0 container logs")
         sys.exit(1)
 
-    # ── 5. If chaincode already committed, skip ALL lifecycle steps ─────────
     if _chaincode_committed(CHANNEL, CC_NAME, base_env):
         ok(f"Chaincode '{CC_NAME}' already committed on '{CHANNEL}' \u2014 skipping lifecycle")
         return
 
-    # ── 6. Package ─────────────────────────────────────────────────────────
     pkg_tar = Path("security_logger.tar.gz")
     if not pkg_tar.exists():
         info("Packaging chaincode ...")
@@ -879,7 +841,6 @@ def setup_channel_and_chaincode():
     else:
         ok("security_logger.tar.gz already exists \u2014 skipping package")
 
-    # ── 7. Check/Install ───────────────────────────────────────────────────
     if _chaincode_installed(CC_NAME, PEER_ADDR, peer_tls_ca, base_env):
         ok("Chaincode already installed on peer0")
     else:
@@ -894,7 +855,6 @@ def setup_channel_and_chaincode():
             err(f"chaincode install failed (rc={rc}) \u2014 cannot continue")
             sys.exit(1)
 
-    # ── 8. Query package ID ────────────────────────────────────────────────
     info("Querying installed chaincode ...")
     result = subprocess.run([
         "peer", "lifecycle", "chaincode", "queryinstalled",
@@ -915,14 +875,12 @@ def setup_channel_and_chaincode():
 
     ok(f"Package ID: {pkg_id}")
 
-    # ── 9. Check orderer reachability — skip approve+commit if NOT_FOUND ───
     if not _orderer_reachable(ORDERER_ADDR, orderer_tls, CHANNEL, base_env):
         warn("Orderer returned NOT_FOUND for channel \u2014 chaincode installed on peer.")
         warn("Approve+commit requires the orderer to know the channel.")
         warn("The stack will continue; services will use peer-side endorsement only.")
         return
 
-    # ── 10. Check/Approve ──────────────────────────────────────────────────
     if _chaincode_approved(CHANNEL, CC_NAME, CC_SEQUENCE, ORDERER_ADDR, orderer_tls, base_env):
         ok("Chaincode already approved for Org1 \u2014 skipping approveformyorg")
     else:
@@ -945,7 +903,6 @@ def setup_channel_and_chaincode():
             sys.exit(1)
         ok("Chaincode approved")
 
-    # ── 11. Commit ─────────────────────────────────────────────────────────
     info("Committing chaincode ...")
     rc = subprocess.call([
         "peer", "lifecycle", "chaincode", "commit",
@@ -967,7 +924,7 @@ def setup_channel_and_chaincode():
 
 
 # ============================================================
-# 5. START PYTHON SERVICES  (fail fast if any service doesn't bind)
+# 5. START PYTHON SERVICES  (fail fast if any service doesn't start)
 # ============================================================
 
 def wait_for_port(port: int, timeout: int = 60) -> bool:
@@ -981,18 +938,51 @@ def wait_for_port(port: int, timeout: int = 60) -> bool:
     return False
 
 
+def _wait_for_log_line(log_path: Path, marker: str, proc,
+                       timeout: int = 60) -> bool:
+    """
+    Poll log_path until `marker` appears in the file content OR the process
+    has exited (indicating a startup crash).  Returns True on success.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        # Process crashed — stop waiting immediately
+        if proc.poll() is not None:
+            return False
+        if log_path.exists():
+            content = log_path.read_text(errors="replace")
+            if marker in content:
+                return True
+            # Also treat ERROR lines after startup as a hard failure
+            lines = content.splitlines()
+            for line in lines[-5:]:
+                if "ERROR" in line and "Retrying" not in line and "DLQ" not in line:
+                    # Non-retry error at startup — treat as crash
+                    return False
+        time.sleep(0.5)
+    return False
+
+
+# Services table:
+#   (name, script, health_check)
+# health_check is either:
+#   int  — TCP port to probe (service is an HTTP server)
+#   str  — log-line marker to wait for (service is a background worker)
+_SERVICES = [
+    ("detector-adapter",  "services/detector-adapter/app.py",  8000),
+    # blockchain-logger is a pure Kafka consumer — no HTTP port.
+    # We verify it started by waiting for the 'Subscribed to topic' log line.
+    ("blockchain-logger", "services/blockchain-logger/app.py",  "Subscribed to topic"),
+    ("audit-api",         "services/audit-api/app.py",          8001),
+]
+
+
 def start_services():
     hdr("Step 5 \u2014 Start Python Microservices")
     venv_python, _ = ensure_venv()
 
-    services = [
-        ("detector-adapter",  "services/detector-adapter/app.py",  8000),
-        ("blockchain-logger", "services/blockchain-logger/app.py", 8002),
-        ("audit-api",         "services/audit-api/app.py",         8001),
-    ]
-
     procs = []
-    for name, script, port in services:
+    for name, script, health in _SERVICES:
         script_path = Path(script)
         if not script_path.exists():
             err(f"{script} not found \u2014 cannot start {name}")
@@ -1007,20 +997,29 @@ def start_services():
             stdout=log_fh,
             stderr=log_fh,
         )
-        procs.append((name, p, port, log_fh))
-        info(f"Started {name} (pid {p.pid}) -> :{port}  [log: {log_path}]")
+        port_str = f":{health}" if isinstance(health, int) else "(worker)"
+        procs.append((name, p, health, log_fh))
+        info(f"Started {name} (pid {p.pid}) -> {port_str}  [log: {log_path}]")
 
-    info("Waiting for services to bind (up to 60 s each) ...")
-    for name, p, port, _ in procs:
-        if wait_for_port(port, timeout=60):
-            ok(f"{name} is up on :{port}")
+    info("Waiting for services to be ready (up to 60 s each) ...")
+    for name, p, health, _ in procs:
+        log_path = Path(f"results/{name}.log")
+        if isinstance(health, int):
+            ready = wait_for_port(health, timeout=60)
+            label = f":{health}"
         else:
-            log_path = Path(f"results/{name}.log")
+            # Log-line probe for background workers (no HTTP port)
+            ready = _wait_for_log_line(log_path, health, p, timeout=60)
+            label = f"log marker '{health}'"
+
+        if ready:
+            ok(f"{name} is up ({label})")
+        else:
             tail = ""
             if log_path.exists():
-                lines = log_path.read_text().strip().splitlines()
+                lines = log_path.read_text(errors="replace").strip().splitlines()
                 tail = "\n    ".join(lines[-12:]) if lines else "(empty)"
-            err(f"{name} did NOT bind on :{port} within 60 s")
+            err(f"{name} did NOT become ready ({label}) within 60 s")
             err(f"  Last log lines:\n    {tail}")
             err("Live stack requires all services to be healthy. Fix the error above then re-run.")
             for n2, p2, _, fh2 in procs:
