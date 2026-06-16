@@ -84,6 +84,79 @@ SAMPLE_EVENTS = [
 
 
 # ============================================================
+# Fabric bin dir detection + PATH injection
+# ============================================================
+
+def _detect_fabric_bin_dir() -> str:
+    """
+    Detect the directory containing the Fabric CLI binaries (peer, orderer, …).
+
+    Resolution order:
+      1. FABRIC_BIN_DIR env var  (already set by operator or previous call)
+      2. fabric-samples/bin/ next to FABRIC_CFG_PATH
+         (FABRIC_CFG_PATH = .../fabric-samples/config  → bin is its sibling)
+      3. <repo>/fabric-samples/bin/
+      4. shutil.which("peer") fallback — use its parent directory
+
+    Returns the directory path as a string, or "" if nothing found.
+    """
+    # 1. Already set
+    existing = os.environ.get("FABRIC_BIN_DIR", "").strip()
+    if existing and Path(existing, "peer").exists():
+        return existing
+
+    candidates: list[Path] = []
+
+    # 2. Sibling of FABRIC_CFG_PATH
+    cfg_path_str = os.environ.get("FABRIC_CFG_PATH", "").strip()
+    if cfg_path_str:
+        candidates.append(Path(cfg_path_str).parent / "bin")
+
+    # 3. Repo-relative
+    repo_root = Path(__file__).parent.resolve()
+    candidates.append(repo_root / "fabric-samples" / "bin")
+
+    for c in candidates:
+        if (c / "peer").exists():
+            return str(c)
+
+    # 4. PATH fallback
+    which = shutil.which("peer")
+    if which:
+        return str(Path(which).parent)
+
+    return ""
+
+
+def inject_fabric_bin_into_path() -> str:
+    """
+    Inject the Fabric bin directory into os.environ["PATH"] and
+    os.environ["FABRIC_BIN_DIR"] so all child processes inherit it.
+
+    Returns the resolved bin dir (or "" if not found).
+    """
+    bin_dir = _detect_fabric_bin_dir()
+    if not bin_dir:
+        warn("Could not detect fabric-samples/bin directory — "
+             "set FABRIC_BIN_DIR=/path/to/fabric-samples/bin in .env if peer is missing")
+        return ""
+
+    # Set the dedicated env var (picked up by blockchain-logger's _resolve_peer_bin)
+    os.environ["FABRIC_BIN_DIR"] = bin_dir
+
+    # Also prepend to PATH so shutil.which() and any bare "peer" calls work
+    current_path = os.environ.get("PATH", "")
+    path_parts = current_path.split(os.pathsep)
+    if bin_dir not in path_parts:
+        os.environ["PATH"] = bin_dir + os.pathsep + current_path
+        info(f"Prepended fabric bin dir to PATH: {bin_dir}")
+    else:
+        ok(f"Fabric bin dir already on PATH: {bin_dir}")
+
+    return bin_dir
+
+
+# ============================================================
 def _venv_python_path() -> Path:
     for name in ("python3", "python"):
         candidate = VENV_DIR / "bin" / name
@@ -987,6 +1060,14 @@ def start_services():
     hdr("Step 5 \u2014 Start Python Microservices")
     venv_python, _ = ensure_venv()
 
+    # Inject the Fabric bin directory into the current process environment
+    # BEFORE spawning child processes.  Popen inherits os.environ, so all
+    # services (including blockchain-logger) will have FABRIC_BIN_DIR set
+    # and the bin dir prepended to PATH.
+    fabric_bin = inject_fabric_bin_into_path()
+    if fabric_bin:
+        ok(f"FABRIC_BIN_DIR injected for child processes: {fabric_bin}")
+
     procs = []
     for name, script, health in _SERVICES:
         script_path = Path(script)
@@ -997,11 +1078,14 @@ def start_services():
         log_path.parent.mkdir(exist_ok=True)
         log_fh   = open(log_path, "w")
         svc_dir  = str(script_path.parent.resolve())
+        # Pass the current os.environ (which now includes FABRIC_BIN_DIR
+        # and the updated PATH) explicitly so the child inherits everything.
         p = subprocess.Popen(
             [venv_python, "app.py"],
             cwd=svc_dir,
             stdout=log_fh,
             stderr=log_fh,
+            env=os.environ.copy(),
         )
         port_str = f":{health}" if isinstance(health, int) else "(worker)"
         procs.append((name, p, health, log_fh))
@@ -1058,8 +1142,12 @@ def run_live_demo_and_benchmark() -> dict:
             err(f"  {ev['asset_id']}: ingest failed: {e}")
             sys.exit(1)
 
-    info("Waiting 5 s for blockchain-logger to commit all events ...")
-    time.sleep(5)
+    # 8 events × ~4 s each (IPFS pin + Fabric endorse + commit + Redis write).
+    # 15 s covers sequential commit of all events with a small safety margin.
+    # If the blockchain-logger log shows all 8 "Fabric commit OK" lines before
+    # the 15 s elapses the Step 7 query will simply find data immediately.
+    info("Waiting 15 s for blockchain-logger to commit all events ...")
+    time.sleep(15)
 
     hdr("Step 7 \u2014 Query Audit Trail (live Redis \u2192 Fabric)")
     try:
