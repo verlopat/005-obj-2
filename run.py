@@ -29,17 +29,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # ============================================================
-# Load .env file FIRST — before any os.environ reads
+# Load project.env file FIRST — before any os.environ reads
+# NOTE: env vars file is named "project.env" (not ".env") because
+#       ".env" is the Python virtual environment directory.
 # ============================================================
 def _load_dotenv():
     """
-    Load variables from .env into os.environ.
+    Load variables from project.env into os.environ.
     Uses python-dotenv if available; falls back to a simple parser.
     Never overwrites variables already set in the shell environment.
     """
-    env_file = Path(__file__).parent / ".env"
+    env_file = Path(__file__).parent / "project.env"
     if not env_file.exists():
-        return
+        # legacy fallback: if somehow a .env FILE exists (not directory)
+        legacy = Path(__file__).parent / ".env"
+        if legacy.is_file():
+            env_file = legacy
+        else:
+            return
 
     try:
         from dotenv import load_dotenv
@@ -48,7 +55,7 @@ def _load_dotenv():
     except ImportError:
         pass
 
-    # Fallback: minimal .env parser (no dotenv installed yet)
+    # Fallback: minimal parser (no dotenv installed yet)
     with open(env_file) as fh:
         for raw in fh:
             line = raw.strip()
@@ -152,7 +159,7 @@ def inject_fabric_bin_into_path() -> str:
     bin_dir = _detect_fabric_bin_dir()
     if not bin_dir:
         warn("Could not detect fabric-samples/bin directory — "
-             "set FABRIC_BIN_DIR=/path/to/fabric-samples/bin in .env if peer is missing")
+             "set FABRIC_BIN_DIR=/path/to/fabric-samples/bin in project.env if peer is missing")
         return ""
 
     os.environ["FABRIC_BIN_DIR"] = bin_dir
@@ -541,7 +548,7 @@ def _chaincode_approved(channel: str, name: str, sequence: str,
         "--tls", "--cafile", orderer_tls,
     ], env)
     if r.returncode != 0:
-        warn(f"checkcommitreadiness returned {r.returncode} \u2014 assuming not yet approved")
+        warn(f"checkcommitreadiness returned {r.returncode} — assuming not yet approved")
         return False
     try:
         data = json.loads(r.stdout)
@@ -563,13 +570,13 @@ def _chaincode_committed(channel: str, name: str, env: dict) -> bool:
 # ============================================================
 
 def check_prereqs() -> bool:
-    hdr("Step 1 \u2014 Prerequisite Check (live mode)")
+    hdr("Step 1 — Prerequisite Check (live mode)")
     all_ok = True
 
     def chk(label, cmd):
         nonlocal all_ok
         if shutil.which(cmd[0]) is None:
-            err(f"{label} not found \u2014 install it first")
+            err(f"{label} not found — install it first")
             all_ok = False
             return
         try:
@@ -583,14 +590,13 @@ def check_prereqs() -> bool:
     chk("Docker Compose", ["docker", "compose", "version"])
     chk("Go",             ["go", "version"])
 
-    # Inject Fabric bin dir into PATH before checking for binaries
     inject_fabric_bin_into_path()
 
     for bin_ in ["cryptogen", "configtxgen", "peer"]:
         if shutil.which(bin_):
             ok(f"Fabric binary: {bin_}")
         else:
-            err(f"Fabric binary '{bin_}' not in PATH \u2014 add fabric-samples/bin to PATH")
+            err(f"Fabric binary '{bin_}' not in PATH — add fabric-samples/bin to PATH")
             all_ok = False
 
     cfg_path = find_fabric_cfg_path()
@@ -610,7 +616,7 @@ def check_prereqs() -> bool:
         if val:
             ok(f"env {var}: [set]")
         else:
-            err(f"env {var}: MISSING \u2014 add it to .env then re-run")
+            err(f"env {var}: MISSING — add it to project.env then re-run")
             all_ok = False
 
     return all_ok
@@ -625,7 +631,7 @@ def _generate_agent_keypair():
     cert_path = Path("crypto-config/agent/signcerts/agent.pem")
 
     if key_path.exists() and cert_path.exists():
-        ok("Agent keypair already exists \u2014 skipping")
+        ok("Agent keypair already exists — skipping")
         return
 
     info("Generating agent EC keypair (P-256) ...")
@@ -675,7 +681,7 @@ def _generate_agent_keypair():
     cert_path.parent.mkdir(parents=True, exist_ok=True)
     cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
 
-    ok(f"Agent keypair written \u2192 {key_path}  /  {cert_path}")
+    ok(f"Agent keypair written → {key_path}  /  {cert_path}")
 
 
 # ============================================================
@@ -683,7 +689,7 @@ def _generate_agent_keypair():
 # ============================================================
 
 def generate_crypto_and_genesis():
-    hdr("Step 2 \u2014 Generate Crypto Material & Genesis Block")
+    hdr("Step 2 — Generate Crypto Material & Genesis Block")
 
     crypto_cfg = Path("crypto-config.yaml")
     if not crypto_cfg.exists():
@@ -711,7 +717,7 @@ PeerOrgs:
         subprocess.check_call(["cryptogen", "generate", "--config=./crypto-config.yaml"])
         ok("crypto-config/ generated")
     else:
-        ok("crypto-config/ already exists \u2014 skipping")
+        ok("crypto-config/ already exists — skipping")
 
     genesis = Path("channel-artifacts/genesis.block")
     if not genesis.exists():
@@ -722,7 +728,7 @@ PeerOrgs:
         ])
         ok("genesis.block created")
     else:
-        ok("genesis.block already exists \u2014 skipping")
+        ok("genesis.block already exists — skipping")
 
     ch_tx = Path("channel-artifacts/security-channel.tx")
     if not ch_tx.exists():
@@ -733,7 +739,7 @@ PeerOrgs:
         ])
         ok("security-channel.tx created")
     else:
-        ok("security-channel.tx already exists \u2014 skipping")
+        ok("security-channel.tx already exists — skipping")
 
     _generate_agent_keypair()
 
@@ -743,8 +749,8 @@ PeerOrgs:
 # ============================================================
 
 def start_docker_stack():
-    hdr("Step 3 \u2014 Start Docker Stack")
-    info("Running: docker compose up -d  (this may pull images \u2014 ~2 min first time)")
+    hdr("Step 3 — Start Docker Stack")
+    info("Running: docker compose up -d  (this may pull images — ~2 min first time)")
     subprocess.check_call(["docker", "compose", "up", "-d"])
     info("Waiting 30 s for containers to initialise ...")
     time.sleep(30)
@@ -764,7 +770,7 @@ def start_docker_stack():
 
 
 def teardown_docker_stack():
-    hdr("Teardown \u2014 Stopping all containers")
+    hdr("Teardown — Stopping all containers")
     subprocess.call(["docker", "compose", "down", "-v", "--remove-orphans"])
     ok("Stack stopped and volumes removed")
 
@@ -774,7 +780,7 @@ def teardown_docker_stack():
 # ============================================================
 
 def setup_channel_and_chaincode():
-    hdr("Step 4 \u2014 Create Channel & Deploy Chaincode")
+    hdr("Step 4 — Create Channel & Deploy Chaincode")
 
     inject_etc_hosts()
 
@@ -833,10 +839,10 @@ def setup_channel_and_chaincode():
         ], env=base_env)
         ok("Channel created")
     else:
-        ok(f"{CHANNEL}.block exists and orderer confirms channel \u2014 skipping create")
+        ok(f"{CHANNEL}.block exists and orderer confirms channel — skipping create")
 
     if not _wait_for_peer_port("peer0.org1.example.com", 7051, timeout=60):
-        err("peer0:7051 did not become reachable within 60 s \u2014 check container logs")
+        err("peer0:7051 did not become reachable within 60 s — check container logs")
         sys.exit(1)
 
     already_joined = (not force_rejoin) and _channel_exists(CHANNEL, base_env)
@@ -855,15 +861,15 @@ def setup_channel_and_chaincode():
         if rc == 0:
             ok("peer0 joined channel")
         else:
-            err(f"peer channel join failed (rc={rc}) \u2014 cannot continue")
+            err(f"peer channel join failed (rc={rc}) — cannot continue")
             sys.exit(1)
 
     if not _peer_ledger_synced(CHANNEL, ORDERER_ADDR, orderer_tls, base_env, timeout=90):
-        err("Peer ledger did not sync within 90 s \u2014 check peer0 container logs")
+        err("Peer ledger did not sync within 90 s — check peer0 container logs")
         sys.exit(1)
 
     if _chaincode_committed(CHANNEL, CC_NAME, base_env):
-        ok(f"Chaincode '{CC_NAME}' already committed on '{CHANNEL}' \u2014 skipping lifecycle")
+        ok(f"Chaincode '{CC_NAME}' already committed on '{CHANNEL}' — skipping lifecycle")
         return
 
     pkg_tar = Path("security_logger.tar.gz")
@@ -878,12 +884,12 @@ def setup_channel_and_chaincode():
             "--label", f"{CC_NAME}_1.0",
         ], env=base_env)
     else:
-        ok("security_logger.tar.gz already exists \u2014 skipping package")
+        ok("security_logger.tar.gz already exists — skipping package")
 
     if _chaincode_installed(CC_NAME, PEER_ADDR, peer_tls_ca, base_env):
         ok("Chaincode already installed on peer0")
     else:
-        info("Installing chaincode (compiles Go \u2014 ~1 min) ...")
+        info("Installing chaincode (compiles Go — ~1 min) ...")
         rc = subprocess.call([
             "peer", "lifecycle", "chaincode", "install",
             str(pkg_tar),
@@ -891,7 +897,7 @@ def setup_channel_and_chaincode():
             "--tlsRootCertFiles", peer_tls_ca,
         ], env=base_env)
         if rc != 0:
-            err(f"chaincode install failed (rc={rc}) \u2014 cannot continue")
+            err(f"chaincode install failed (rc={rc}) — cannot continue")
             sys.exit(1)
 
     info("Querying installed chaincode ...")
@@ -909,19 +915,19 @@ def setup_channel_and_chaincode():
             break
 
     if not pkg_id:
-        err("Could not parse package ID \u2014 cannot approve or commit")
+        err("Could not parse package ID — cannot approve or commit")
         sys.exit(1)
 
     ok(f"Package ID: {pkg_id}")
 
     if not _orderer_reachable(ORDERER_ADDR, orderer_tls, CHANNEL, base_env):
-        warn("Orderer returned NOT_FOUND for channel \u2014 chaincode installed on peer.")
+        warn("Orderer returned NOT_FOUND for channel — chaincode installed on peer.")
         warn("Approve+commit requires the orderer to know the channel.")
         warn("The stack will continue; services will use peer-side endorsement only.")
         return
 
     if _chaincode_approved(CHANNEL, CC_NAME, CC_SEQUENCE, ORDERER_ADDR, orderer_tls, base_env):
-        ok("Chaincode already approved for Org1 \u2014 skipping approveformyorg")
+        ok("Chaincode already approved for Org1 — skipping approveformyorg")
     else:
         info("Approving chaincode for Org1 ...")
         rc = subprocess.call([
@@ -938,7 +944,7 @@ def setup_channel_and_chaincode():
             "--tlsRootCertFiles", peer_tls_ca,
         ], env=base_env)
         if rc != 0:
-            err(f"approveformyorg failed (rc={rc}) \u2014 check orderer TLS CA path")
+            err(f"approveformyorg failed (rc={rc}) — check orderer TLS CA path")
             sys.exit(1)
         ok("Chaincode approved")
 
@@ -956,7 +962,7 @@ def setup_channel_and_chaincode():
         "--tlsRootCertFiles", peer_tls_ca,
     ], env=base_env)
     if rc == 0:
-        ok("Chaincode committed \u2014 fully deployed on security-channel")
+        ok("Chaincode committed — fully deployed on security-channel")
     else:
         err(f"chaincode commit failed (rc={rc})")
         sys.exit(1)
@@ -1003,7 +1009,7 @@ _SERVICES = [
 
 
 def start_services():
-    hdr("Step 5 \u2014 Start Python Microservices")
+    hdr("Step 5 — Start Python Microservices")
     venv_python, _ = ensure_venv()
 
     fabric_bin = inject_fabric_bin_into_path()
@@ -1018,7 +1024,7 @@ def start_services():
     for name, script, health in _SERVICES:
         script_path = Path(script)
         if not script_path.exists():
-            err(f"{script} not found \u2014 cannot start {name}")
+            err(f"{script} not found — cannot start {name}")
             sys.exit(1)
         log_path = Path(f"results/{name}.log")
         log_path.parent.mkdir(exist_ok=True)
@@ -1074,7 +1080,7 @@ def run_live_demo_and_benchmark() -> dict:
     DETECTOR_URL = os.getenv("DETECTOR_URL", "http://localhost:8000")
     AUDIT_URL    = os.getenv("AUDIT_URL",    "http://localhost:8001")
 
-    hdr("Step 6 \u2014 Ingest Test Events (live Fabric+IPFS+Kafka)")
+    hdr("Step 6 — Ingest Test Events (live Fabric+IPFS+Kafka)")
     for ev in SAMPLE_EVENTS:
         try:
             r = requests.post(f"{DETECTOR_URL}/api/v1/events", json=ev, timeout=10)
@@ -1088,7 +1094,7 @@ def run_live_demo_and_benchmark() -> dict:
     info("Waiting 15 s for blockchain-logger to commit all events ...")
     time.sleep(15)
 
-    hdr("Step 7 \u2014 Query Audit Trail (live Redis \u2192 Fabric)")
+    hdr("Step 7 — Query Audit Trail (live Redis → Fabric)")
     try:
         r = requests.post(
             f"{AUDIT_URL}/api/v1/audit/trail",
@@ -1098,7 +1104,7 @@ def run_live_demo_and_benchmark() -> dict:
         r.raise_for_status()
         records = r.json()
         if not records:
-            err("Audit trail returned [] for aws-ec2-i-001 \u2014 logger may not have committed yet")
+            err("Audit trail returned [] for aws-ec2-i-001 — logger may not have committed yet")
             sys.exit(1)
         print(json.dumps(records, indent=2))
         ok(f"{len(records)} record(s) found on live ledger")
@@ -1106,7 +1112,7 @@ def run_live_demo_and_benchmark() -> dict:
         err(f"Audit query failed: {e}")
         sys.exit(1)
 
-    hdr("Step 8 \u2014 Integrity Verification (live IPFS + ECDSA)")
+    hdr("Step 8 — Integrity Verification (live IPFS + ECDSA)")
     first_event_id = records[0].get("event_id")
     if first_event_id:
         try:
@@ -1115,14 +1121,14 @@ def run_live_demo_and_benchmark() -> dict:
             result = r.json()
             status = result.get("status")
             if status != "VALID":
-                err(f"Integrity check returned status={status} \u2014 expected VALID")
+                err(f"Integrity check returned status={status} — expected VALID")
                 sys.exit(1)
             ok(f"Integrity VALID  event_id={first_event_id[:16]}...")
         except Exception as e:
             err(f"Verify call failed: {e}")
             sys.exit(1)
 
-    hdr("Step 9 \u2014 Compliance Report (live)")
+    hdr("Step 9 — Compliance Report (live)")
     try:
         r = requests.post(f"{AUDIT_URL}/api/v1/compliance/report", json={
             "standard": "ISO-27001",
@@ -1133,7 +1139,7 @@ def run_live_demo_and_benchmark() -> dict:
     except Exception as e:
         warn(f"Compliance report failed: {e}")
 
-    hdr("Step 10 \u2014 Live Benchmark (500 events against real Fabric/IPFS stack)")
+    hdr("Step 10 — Live Benchmark (500 events against real Fabric/IPFS stack)")
     latencies, errors = [], 0
     t_start = time.perf_counter()
     for i in range(500):
@@ -1157,7 +1163,7 @@ def run_live_demo_and_benchmark() -> dict:
        f"mean={mean:.1f}ms  p95={p95:.1f}ms  p99={p99:.1f}ms")
 
     if errors > 50:
-        err(f"{errors}/500 benchmark events failed \u2014 Fabric pipeline unhealthy")
+        err(f"{errors}/500 benchmark events failed — Fabric pipeline unhealthy")
         sys.exit(1)
 
     return {
@@ -1221,7 +1227,7 @@ def print_and_save_results(results: dict):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Objective 2 \u2014 Live end-to-end executor (no mock paths)"
+        description="Objective 2 — Live end-to-end executor (no mock paths)"
     )
     parser.add_argument("--teardown",     action="store_true", help="Stop Docker stack")
     parser.add_argument("--results-only", action="store_true", help="Print last results")
@@ -1246,7 +1252,7 @@ def main():
         if RESULTS_FILE.exists():
             print(RESULTS_FILE.read_text())
         else:
-            warn("No results file found \u2014 run without --results-only first")
+            warn("No results file found — run without --results-only first")
         return
 
     if args.teardown:
