@@ -289,18 +289,13 @@ def _channel_exists(channel: str, env: dict) -> bool:
     return channel in r.stdout
 
 
-def _peer_joined(channel: str, env: dict) -> bool:
-    return _channel_exists(channel, env)
-
-
 def _channel_exists_on_orderer(channel: str, orderer_addr: str,
                                 orderer_tls: str, env: dict) -> bool:
     """Ask the orderer directly whether it knows about this channel.
     Uses osnadmin if available, falls back to a peer channel fetch probe."""
-    # Try osnadmin (Fabric 2.3+) — available in fabric-samples/bin
     if shutil.which("osnadmin"):
         orderer_admin_addr = orderer_addr.replace("7050", "7053")
-        orderer_tls_dir = Path(orderer_tls).parent.parent  # tls/ dir
+        orderer_tls_dir = Path(orderer_tls).parent.parent
         admin_cert = str(orderer_tls_dir / "tls" / "server.crt")
         admin_key  = str(orderer_tls_dir / "tls" / "server.key")
         r = subprocess.run([
@@ -317,9 +312,8 @@ def _channel_exists_on_orderer(channel: str, orderer_addr: str,
                 return channel in channels
             except Exception:
                 return channel in r.stdout
-        # osnadmin failed — fall through to peer probe
 
-    # Fallback: try fetching block 0 from orderer; NOT_FOUND => channel absent
+    # Fallback: fetch block 0; NOT_FOUND => channel absent on orderer
     r = _peer_run([
         "peer", "channel", "fetch", "0",
         "/dev/null",
@@ -332,6 +326,29 @@ def _channel_exists_on_orderer(channel: str, orderer_addr: str,
     if "not_found" in combined or "does not exist" in combined:
         return False
     return r.returncode == 0
+
+
+def _peer_ledger_synced(channel: str, orderer_addr: str, orderer_tls: str,
+                        env: dict, timeout: int = 60) -> bool:
+    """Poll until peer deliver stream is ready for the channel (no EOF/UNAVAILABLE).
+    Returns True when peer channel getinfo succeeds, False on timeout."""
+    info(f"Waiting for peer ledger to sync on {channel} (up to {timeout}s) ...")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r = _peer_run(["peer", "channel", "getinfo", "-c", channel], env)
+        if r.returncode == 0 and "Blockchain info" in r.stdout:
+            ok("Peer ledger synced and deliver stream ready")
+            return True
+        combined = (r.stdout + r.stderr).lower()
+        if "eof" in combined or "unavailable" in combined or "not found" in combined:
+            time.sleep(3)
+            continue
+        # Any other non-zero is a config error, not a timing issue
+        if r.returncode != 0:
+            warn(f"getinfo returned: {r.stderr.strip()[:120]}")
+            time.sleep(3)
+            continue
+    return False
 
 
 def _chaincode_installed(name: str, peer_addr: str, tls_cert: str, env: dict) -> bool:
@@ -374,8 +391,8 @@ def _chaincode_approved(channel: str, name: str, sequence: str,
         "--tls", "--cafile", orderer_tls,
     ], env)
     if r.returncode != 0:
-        warn(f"checkcommitreadiness returned {r.returncode} \u2014 assuming already approved")
-        return True
+        warn(f"checkcommitreadiness returned {r.returncode} \u2014 assuming not yet approved")
+        return False
     try:
         data = json.loads(r.stdout)
         return data.get("approvals", {}).get("Org1MSP", False) is True
@@ -575,19 +592,24 @@ def setup_channel_and_chaincode():
         "CORE_PEER_TLS_ROOTCERT_FILE": peer_tls_ca,
     }
 
-    # ── 1. Orderer-aware channel create (fixes stale-block vs fresh-orderer) ─
+    # ── 1. Orderer-aware channel create ────────────────────────────────────
+    #
+    # Three states we handle:
+    #   A) Fresh run: no block file, orderer clean  → create + join
+    #   B) Stale run: block file exists, orderer clean (volumes wiped)
+    #                → delete stale block, set force_rejoin=True, create + join
+    #   C) Normal re-run: block file exists, orderer has channel
+    #                → skip create; verify peer is properly joined
+    #
     block = Path(f"channel-artifacts/{CHANNEL}.block")
+    force_rejoin = False
 
-    # If the block file exists locally, verify the orderer actually knows about
-    # the channel. If not (e.g. orderer restarted with a clean volume), delete
-    # the stale block so we recreate it properly via `peer channel create`.
     if block.exists():
         if not _channel_exists_on_orderer(CHANNEL, ORDERER_ADDR, orderer_tls, base_env):
             warn(f"{CHANNEL}.block exists locally but orderer has no record of channel.")
-            warn("Deleting stale block and recreating channel on fresh orderer ...")
+            warn("Stale block detected — deleting and recreating channel on fresh orderer ...")
             block.unlink()
-            # Also reset peer ledger state for this channel if peer has it
-            # (peer channel join will re-sync from the new block)
+            force_rejoin = True  # peer ledger is stale too; must rejoin
 
     if not block.exists():
         info("Creating channel ...")
@@ -604,11 +626,21 @@ def setup_channel_and_chaincode():
     else:
         ok(f"{CHANNEL}.block exists and orderer confirms channel \u2014 skipping create")
 
-    # ── 2. Check peer joined ────────────────────────────────────────────────
-    if _peer_joined(CHANNEL, base_env):
+    # ── 2. Join peer (force-rejoin if we just recreated the channel) ───────
+    #
+    # When force_rejoin=True the peer's in-memory channel list may still show
+    # the old (stale) channel entry, so we skip _channel_exists() and always
+    # call `peer channel join` with the fresh block.
+    #
+    already_joined = (not force_rejoin) and _channel_exists(CHANNEL, base_env)
+
+    if already_joined:
         ok(f"peer0 already joined {CHANNEL}")
     else:
-        info("Joining peer0 to channel ...")
+        if force_rejoin:
+            info("Force-rejoining peer0 to channel (stale ledger detected) ...")
+        else:
+            info("Joining peer0 to channel ...")
         rc = subprocess.call(
             ["peer", "channel", "join", "-b", str(block.resolve())],
             env=base_env,
@@ -619,12 +651,23 @@ def setup_channel_and_chaincode():
             err(f"peer channel join failed (rc={rc}) \u2014 cannot continue")
             sys.exit(1)
 
-    # ── 3. If chaincode already committed, skip ALL lifecycle steps ─────────
+    # ── 3. Wait for peer deliver stream to be ready ────────────────────────
+    #
+    # approveformyorg uses the peer's deliver service internally.  If the peer
+    # ledger hasn't finished syncing block 0 from the orderer yet, it returns
+    # EOF on the deliver stream — even though the channel join returned 0.
+    # We poll `peer channel getinfo` until it succeeds before continuing.
+    #
+    if not _peer_ledger_synced(CHANNEL, ORDERER_ADDR, orderer_tls, base_env, timeout=90):
+        err("Peer ledger did not sync within 90 s — check peer0 container logs")
+        sys.exit(1)
+
+    # ── 4. If chaincode already committed, skip ALL lifecycle steps ─────────
     if _chaincode_committed(CHANNEL, CC_NAME, base_env):
         ok(f"Chaincode '{CC_NAME}' already committed on '{CHANNEL}' \u2014 skipping lifecycle")
         return
 
-    # ── 4. Package ─────────────────────────────────────────────────────────
+    # ── 5. Package ─────────────────────────────────────────────────────────
     pkg_tar = Path("security_logger.tar.gz")
     if not pkg_tar.exists():
         info("Packaging chaincode ...")
@@ -639,7 +682,7 @@ def setup_channel_and_chaincode():
     else:
         ok("security_logger.tar.gz already exists \u2014 skipping package")
 
-    # ── 5. Check/Install ───────────────────────────────────────────────────
+    # ── 6. Check/Install ───────────────────────────────────────────────────
     if _chaincode_installed(CC_NAME, PEER_ADDR, peer_tls_ca, base_env):
         ok("Chaincode already installed on peer0")
     else:
@@ -654,7 +697,7 @@ def setup_channel_and_chaincode():
             err(f"chaincode install failed (rc={rc}) \u2014 cannot continue")
             sys.exit(1)
 
-    # ── 6. Query package ID ────────────────────────────────────────────────
+    # ── 7. Query package ID ────────────────────────────────────────────────
     info("Querying installed chaincode ...")
     result = subprocess.run([
         "peer", "lifecycle", "chaincode", "queryinstalled",
@@ -675,14 +718,14 @@ def setup_channel_and_chaincode():
 
     ok(f"Package ID: {pkg_id}")
 
-    # ── 7. Check orderer reachability — skip approve+commit if NOT_FOUND ───
+    # ── 8. Check orderer reachability — skip approve+commit if NOT_FOUND ───
     if not _orderer_reachable(ORDERER_ADDR, orderer_tls, CHANNEL, base_env):
         warn("Orderer returned NOT_FOUND for channel \u2014 chaincode installed on peer.")
         warn("Approve+commit requires the orderer to know the channel.")
         warn("The stack will continue; services will use peer-side endorsement only.")
         return
 
-    # ── 8. Check/Approve ───────────────────────────────────────────────────
+    # ── 9. Check/Approve ───────────────────────────────────────────────────
     if _chaincode_approved(CHANNEL, CC_NAME, CC_SEQUENCE, ORDERER_ADDR, orderer_tls, base_env):
         ok("Chaincode already approved for Org1 \u2014 skipping approveformyorg")
     else:
@@ -705,7 +748,7 @@ def setup_channel_and_chaincode():
             sys.exit(1)
         ok("Chaincode approved")
 
-    # ── 9. Commit ──────────────────────────────────────────────────────────
+    # ── 10. Commit ─────────────────────────────────────────────────────────
     info("Committing chaincode ...")
     rc = subprocess.call([
         "peer", "lifecycle", "chaincode", "commit",
@@ -1005,7 +1048,7 @@ def main():
         for name, p, _, fh in procs:
             p.terminate()
             fh.close()
-            info(f"Stopped {name}")
+            info(f"Stopped {n}")
 
 
 if __name__ == "__main__":
