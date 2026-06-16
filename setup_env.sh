@@ -8,8 +8,8 @@
 #    source .env/bin/activate
 #
 #  After activation:
-#    python run.py --mock          # quick smoke-test (no Docker needed)
-#    python run.py                 # full live run (Docker required)
+#    python run.py          # full live run (Docker + Fabric required)
+#    python run.py --teardown
 # =============================================================================
 
 set -euo pipefail
@@ -41,7 +41,7 @@ for candidate in python3 python3.13 python3.12 python3.11 python3.10 python3.9; 
 done
 
 if [ -z "$PYTHON" ]; then
-    err "Python 3.9+ not found. Install it first (e.g. sudo pacman -S python or sudo apt install python3)."
+    err "Python 3.9+ not found. Install it first."
     exit 1
 fi
 
@@ -49,7 +49,6 @@ fi
 hdr "Step 2 — Create virtual environment at ./${VENV_DIR}/"
 
 if [ -d "${VENV_DIR}" ]; then
-    # Check if it's a real venv (has bin/python3 or Scripts/python.exe)
     if [ -f "${VENV_DIR}/bin/python3" ] || [ -f "${VENV_DIR}/Scripts/python.exe" ]; then
         ok "Existing venv looks healthy — skipping recreation"
         ok "  (delete .env/ and re-run to force a clean rebuild)"
@@ -76,7 +75,7 @@ elif [ -f "${VENV_DIR}/Scripts/python.exe" ]; then
     VENV_PYTHON="${VENV_DIR}/Scripts/python.exe"
     VENV_PIP="${VENV_DIR}/Scripts/pip.exe"
 else
-    err "Cannot find python inside ${VENV_DIR}/ — something went wrong with venv creation."
+    err "Cannot find python inside ${VENV_DIR}/ — venv creation failed."
     exit 1
 fi
 
@@ -110,16 +109,16 @@ for svc in "${SERVICES[@]}"; do
 done
 
 # ── Install top-level script dependencies ────────────────────────────────────
-hdr "Step 6 — Install top-level script deps (requests, cryptography, flask, confluent-kafka)"
-"$VENV_PIP" install requests cryptography flask "confluent-kafka>=2.3" apscheduler -q
-ok "Script deps installed"
+hdr "Step 6 — Install top-level script deps"
+"$VENV_PIP" install requests cryptography flask "confluent-kafka>=2.3" apscheduler python-dotenv -q
+ok "Script deps installed (includes python-dotenv for .env loading)"
 
 # ── Copy .env.example → .env if not already present ─────────────────────────
 hdr "Step 7 — Environment config"
 if [ ! -f ".env" ]; then
     if [ -f ".env.example" ]; then
         cp .env.example .env
-        ok "Copied .env.example → .env  (edit as needed for your setup)"
+        ok "Copied .env.example → .env  (edit paths as needed)"
     else
         warn ".env.example not found — skipping .env creation"
     fi
@@ -137,7 +136,6 @@ echo -e "  ${CYAN}Activate with:${RESET}"
 echo -e "    ${BOLD}source .env/bin/activate${RESET}"
 echo ""
 echo -e "  ${CYAN}Then run:${RESET}"
-echo -e "    ${BOLD}python run.py --mock${RESET}        # no Docker needed"
 echo -e "    ${BOLD}python run.py${RESET}               # full live run"
 echo -e "    ${BOLD}python run.py --teardown${RESET}    # stop Docker stack"
 echo ""
