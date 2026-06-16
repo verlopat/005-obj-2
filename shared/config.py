@@ -81,6 +81,13 @@ FABRIC_MAX_RETRIES: int          = int(_optional("FABRIC_MAX_RETRIES", "3"))
 FABRIC_RETRY_BACKOFF_S: float    = float(_optional("FABRIC_RETRY_BACKOFF_S", "2.0"))
 FABRIC_INVOKE_TIMEOUT_S: int     = int(_optional("FABRIC_INVOKE_TIMEOUT_S", "60"))
 
+# Absolute path to the directory that contains the Fabric CLI binaries
+# (peer, orderer, configtxgen, etc.).  When set, the logger prepends it to
+# PATH so the `peer` binary can always be found even if the process was
+# spawned without the operator's shell PATH.  run.py auto-detects this from
+# fabric-samples/bin and injects it; set manually if binaries live elsewhere.
+FABRIC_BIN_DIR: str = _optional("FABRIC_BIN_DIR", "")
+
 
 # ── IPFS ──────────────────────────────────────────────────────────────────────────────
 
@@ -146,6 +153,7 @@ def dump() -> dict:
         "FABRIC_TLS_CERT":          "[set]" if FABRIC_TLS_CERT else "[MISSING]",
         "FABRIC_SIGN_CERT":         "[set]" if FABRIC_SIGN_CERT else "[MISSING]",
         "FABRIC_SIGN_KEY":          "[set]" if FABRIC_SIGN_KEY else "[MISSING]",
+        "FABRIC_BIN_DIR":           FABRIC_BIN_DIR or "[auto-detect]",
         "IPFS_API_URL":             IPFS_API_URL,
         "REDIS_URL":                REDIS_URL,
         "AGENT_KEY_PATH":           AGENT_KEY_PATH,
