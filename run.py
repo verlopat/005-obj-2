@@ -293,6 +293,47 @@ def _peer_joined(channel: str, env: dict) -> bool:
     return _channel_exists(channel, env)
 
 
+def _channel_exists_on_orderer(channel: str, orderer_addr: str,
+                                orderer_tls: str, env: dict) -> bool:
+    """Ask the orderer directly whether it knows about this channel.
+    Uses osnadmin if available, falls back to a peer channel fetch probe."""
+    # Try osnadmin (Fabric 2.3+) — available in fabric-samples/bin
+    if shutil.which("osnadmin"):
+        orderer_admin_addr = orderer_addr.replace("7050", "7053")
+        orderer_tls_dir = Path(orderer_tls).parent.parent  # tls/ dir
+        admin_cert = str(orderer_tls_dir / "tls" / "server.crt")
+        admin_key  = str(orderer_tls_dir / "tls" / "server.key")
+        r = subprocess.run([
+            "osnadmin", "channel", "list",
+            "--orderer-address", orderer_admin_addr,
+            "--ca-file",         orderer_tls,
+            "--client-cert",     admin_cert,
+            "--client-key",      admin_key,
+        ], capture_output=True, text=True)
+        if r.returncode == 0:
+            try:
+                data = json.loads(r.stdout)
+                channels = [c["name"] for c in data.get("channels", [])]
+                return channel in channels
+            except Exception:
+                return channel in r.stdout
+        # osnadmin failed — fall through to peer probe
+
+    # Fallback: try fetching block 0 from orderer; NOT_FOUND => channel absent
+    r = _peer_run([
+        "peer", "channel", "fetch", "0",
+        "/dev/null",
+        "-c", channel,
+        "-o", orderer_addr,
+        "--ordererTLSHostnameOverride", "orderer.example.com",
+        "--tls", "--cafile", orderer_tls,
+    ], env)
+    combined = (r.stdout + r.stderr).lower()
+    if "not_found" in combined or "does not exist" in combined:
+        return False
+    return r.returncode == 0
+
+
 def _chaincode_installed(name: str, peer_addr: str, tls_cert: str, env: dict) -> bool:
     r = _peer_run([
         "peer", "lifecycle", "chaincode", "queryinstalled",
@@ -333,7 +374,7 @@ def _chaincode_approved(channel: str, name: str, sequence: str,
         "--tls", "--cafile", orderer_tls,
     ], env)
     if r.returncode != 0:
-        warn(f"checkcommitreadiness returned {r.returncode} — assuming already approved")
+        warn(f"checkcommitreadiness returned {r.returncode} \u2014 assuming already approved")
         return True
     try:
         data = json.loads(r.stdout)
@@ -534,8 +575,20 @@ def setup_channel_and_chaincode():
         "CORE_PEER_TLS_ROOTCERT_FILE": peer_tls_ca,
     }
 
-    # ── 1. Channel join (idempotent) ───────────────────────────────────────
+    # ── 1. Orderer-aware channel create (fixes stale-block vs fresh-orderer) ─
     block = Path(f"channel-artifacts/{CHANNEL}.block")
+
+    # If the block file exists locally, verify the orderer actually knows about
+    # the channel. If not (e.g. orderer restarted with a clean volume), delete
+    # the stale block so we recreate it properly via `peer channel create`.
+    if block.exists():
+        if not _channel_exists_on_orderer(CHANNEL, ORDERER_ADDR, orderer_tls, base_env):
+            warn(f"{CHANNEL}.block exists locally but orderer has no record of channel.")
+            warn("Deleting stale block and recreating channel on fresh orderer ...")
+            block.unlink()
+            # Also reset peer ledger state for this channel if peer has it
+            # (peer channel join will re-sync from the new block)
+
     if not block.exists():
         info("Creating channel ...")
         subprocess.check_call([
@@ -549,7 +602,7 @@ def setup_channel_and_chaincode():
         ], env=base_env)
         ok("Channel created")
     else:
-        ok(f"{CHANNEL}.block already exists \u2014 skipping create")
+        ok(f"{CHANNEL}.block exists and orderer confirms channel \u2014 skipping create")
 
     # ── 2. Check peer joined ────────────────────────────────────────────────
     if _peer_joined(CHANNEL, base_env):
@@ -624,7 +677,7 @@ def setup_channel_and_chaincode():
 
     # ── 7. Check orderer reachability — skip approve+commit if NOT_FOUND ───
     if not _orderer_reachable(ORDERER_ADDR, orderer_tls, CHANNEL, base_env):
-        warn("Orderer returned NOT_FOUND for channel — chaincode installed on peer.")
+        warn("Orderer returned NOT_FOUND for channel \u2014 chaincode installed on peer.")
         warn("Approve+commit requires the orderer to know the channel.")
         warn("The stack will continue; services will use peer-side endorsement only.")
         return
