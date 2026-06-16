@@ -7,8 +7,9 @@ Pipeline per message:
   4. Upload canonical bytes to IPFS → get real CID
   5. Compute SHA-256 over canonical bytes
   6. Submit LogSecurityEvent to Fabric
-  7. Ack (commit offset) ONLY after confirmed Fabric tx
-  8. On any failure: bounded retries with exponential backoff → DLQ
+  7. Write record + indexes to Redis (so audit-api can query it)
+  8. Ack (commit offset) ONLY after confirmed Fabric tx + Redis write
+  9. On any failure: bounded retries with exponential backoff → DLQ
 
 No mock path.  No silent drops.
 """
@@ -23,6 +24,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import redis as redis_lib
 from kafka import KafkaConsumer, KafkaProducer
 from kafka.errors import KafkaError
 
@@ -33,6 +35,7 @@ from shared.config import (
     KAFKA_BOOTSTRAP, KAFKA_TOPIC, KAFKA_DLQ_TOPIC, KAFKA_GROUP_ID,
     KAFKA_MAX_RETRIES, KAFKA_RETRY_BASE_S, KAFKA_RETRY_CAP_S,
     IPFS_API_URL, AGENT_KEY_PATH, AGENT_CERT_PATH,
+    REDIS_URL, REDIS_KEY_PREFIX, REDIS_IDX_ASSET, REDIS_IDX_SEV,
 )
 from shared.event_schema import SecurityEvent, canonical_payload, sha256_of
 from shared.ipfs import add_and_pin
@@ -40,6 +43,53 @@ from fabric_client import submit_transaction
 from signer import sign_bytes
 
 log = logging.getLogger(__name__)
+
+_redis_client: redis_lib.Redis | None = None
+
+
+def _get_redis() -> redis_lib.Redis:
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis_lib.from_url(REDIS_URL, decode_responses=True)
+    return _redis_client
+
+
+def _index_in_redis(
+    event: SecurityEvent,
+    event_dict: dict,
+    tx_id: str,
+    cid: str,
+    sha256: str,
+    signature: str,
+) -> None:
+    """Write the committed event record + asset/severity sorted-set indexes to Redis."""
+    r = _get_redis()
+    ts_str = event_dict.get("timestamp") or datetime.now(timezone.utc).isoformat()
+    # Convert ISO timestamp to a float score for ZADD
+    try:
+        ts_score = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        ts_score = time.time()
+
+    record = {
+        **event_dict,
+        "tx_id": tx_id,
+        "ipfs_cid": cid,
+        "sha256": sha256,
+        "agent_signature": signature,
+        "agent_identity": str(AGENT_CERT_PATH),
+    }
+
+    pipe = r.pipeline()
+    # 1. Full record keyed by event_id
+    pipe.set(REDIS_KEY_PREFIX + event.event_id, json.dumps(record))
+    # 2. Asset sorted set (newest-first via positive score)
+    pipe.zadd(REDIS_IDX_ASSET + event.asset_id, {event.event_id: ts_score})
+    # 3. Severity sorted set
+    pipe.zadd(REDIS_IDX_SEV + event.severity, {event.event_id: ts_score})
+    pipe.execute()
+    log.info("[REDIS] indexed event_id=%s asset=%s severity=%s",
+             event.event_id, event.asset_id, event.severity)
 
 
 def _backoff(attempt: int) -> float:
@@ -122,6 +172,14 @@ def process_message(raw_bytes: bytes, producer: KafkaProducer) -> bool:
     except Exception as exc:
         _send_to_dlq(producer, raw_bytes, f"Fabric submit failed: {exc}")
         return False
+
+    # 7. Write to Redis so audit-api can query it
+    try:
+        _index_in_redis(event, event_dict, tx_id, cid, sha256, signature)
+    except Exception as exc:
+        # Redis write failure is non-fatal for the audit trail integrity
+        # (event is already on-chain) but log it loudly.
+        log.error("[REDIS] index write failed for event_id=%s: %s", event.event_id, exc)
 
     log.info(
         "[LOGGER] committed event_id=%s asset=%s tx=%s cid=%s sha256=%.16s…",
