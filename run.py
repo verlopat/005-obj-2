@@ -277,6 +277,102 @@ def _find_orderer_tls_ca() -> str:
 
 
 # ============================================================
+# Peer port reachability gate
+# ============================================================
+
+def _wait_for_peer_port(host: str, port: int, timeout: int = 60) -> bool:
+    """Poll TCP host:port until it accepts connections or timeout expires."""
+    info(f"Waiting for {host}:{port} to accept connections (up to {timeout}s) ...")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=2):
+                ok(f"{host}:{port} is reachable")
+                return True
+        except OSError:
+            time.sleep(2)
+    return False
+
+
+# ============================================================
+# Docker helpers — peer ledger reset
+# ============================================================
+
+def _get_compose_project_name() -> str:
+    """Return the Docker Compose project name (directory name by default)."""
+    result = subprocess.run(
+        ["docker", "compose", "config", "--format", "json"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        try:
+            data = json.loads(result.stdout)
+            name = data.get("name", "")
+            if name:
+                return name
+        except Exception:
+            pass
+    # Fallback: use the current directory name (lowercased, hyphens)
+    return Path(".").resolve().name.lower().replace("_", "-")
+
+
+def _reset_peer_ledger(peer_service: str = "peer0.org1.example.com"):
+    """
+    Remove the peer container and its ledger volume so that the peer starts
+    fresh on the next `docker compose up`.  This is required whenever the
+    orderer is recreated (volumes wiped) because the peer's on-disk block 0
+    hash will no longer match the new orderer's genesis block.
+
+    Steps:
+      1. docker compose rm -sf <peer_service>   — stop + remove container
+      2. docker volume rm <project>_peer0data   — drop ledger volume (best-effort)
+      3. docker compose up -d <peer_service>    — recreate with empty ledger
+    """
+    warn(f"Resetting peer ledger for {peer_service} to clear stale block hashes ...")
+
+    # 1. Stop and remove the peer container
+    subprocess.call(["docker", "compose", "rm", "-sf", peer_service])
+
+    # 2. Remove the named volume that holds /var/hyperledger/production
+    #    Try common volume-name patterns used in the compose file.
+    project = _get_compose_project_name()
+    volume_candidates = [
+        f"{project}_peer0data",
+        f"{project}_peer0.org1.example.com",
+        "peer0data",
+    ]
+    for vol in volume_candidates:
+        r = subprocess.call(
+            ["docker", "volume", "rm", vol],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if r == 0:
+            ok(f"Removed Docker volume: {vol}")
+            break
+    else:
+        # Fallback: inspect running volumes and find ones whose name contains "peer0"
+        r2 = subprocess.run(
+            ["docker", "volume", "ls", "--format", "{{.Name}}"],
+            capture_output=True, text=True,
+        )
+        for vname in r2.stdout.splitlines():
+            if "peer0" in vname.lower():
+                subprocess.call(
+                    ["docker", "volume", "rm", vname],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                ok(f"Removed Docker volume: {vname}")
+
+    # 3. Recreate just the peer container
+    info(f"Recreating {peer_service} container with empty ledger ...")
+    subprocess.check_call(["docker", "compose", "up", "-d", peer_service])
+    info("Waiting 10 s for peer to initialise ...")
+    time.sleep(10)
+
+
+# ============================================================
 # Idempotent chaincode lifecycle checks
 # ============================================================
 
@@ -597,7 +693,7 @@ def setup_channel_and_chaincode():
     # Three states we handle:
     #   A) Fresh run: no block file, orderer clean  → create + join
     #   B) Stale run: block file exists, orderer clean (volumes wiped)
-    #                → delete stale block, set force_rejoin=True, create + join
+    #                → wipe peer ledger, delete stale block, create + join
     #   C) Normal re-run: block file exists, orderer has channel
     #                → skip create; verify peer is properly joined
     #
@@ -607,9 +703,19 @@ def setup_channel_and_chaincode():
     if block.exists():
         if not _channel_exists_on_orderer(CHANNEL, ORDERER_ADDR, orderer_tls, base_env):
             warn(f"{CHANNEL}.block exists locally but orderer has no record of channel.")
-            warn("Stale block detected — deleting and recreating channel on fresh orderer ...")
+            warn("Deleting stale block and recreating channel on fresh orderer ...")
+
+            # ── KEY FIX: wipe peer ledger BEFORE creating new channel ──────
+            # The peer's /var/hyperledger/production still holds block 0 from
+            # the previous orderer run.  If we create the channel first and
+            # the peer tries to gossip/deliver block 1, it will panic with
+            # "unexpected Previous block hash" because block 0 on disk was
+            # written by a different orderer.  Removing the volume first
+            # ensures the peer starts with a clean slate.
+            _reset_peer_ledger("peer0.org1.example.com")
+
             block.unlink()
-            force_rejoin = True  # peer ledger is stale too; must rejoin
+            force_rejoin = True  # peer ledger cleared; must rejoin
 
     if not block.exists():
         info("Creating channel ...")
@@ -626,7 +732,17 @@ def setup_channel_and_chaincode():
     else:
         ok(f"{CHANNEL}.block exists and orderer confirms channel \u2014 skipping create")
 
-    # ── 2. Join peer (force-rejoin if we just recreated the channel) ───────
+    # ── 2. Wait for peer TCP port to be reachable ──────────────────────────
+    #
+    # After _reset_peer_ledger the container is freshly started.  We must
+    # wait until :7051 actually accepts TCP connections before running any
+    # `peer channel` command, otherwise we get "connection refused".
+    #
+    if not _wait_for_peer_port("peer0.org1.example.com", 7051, timeout=60):
+        err("peer0:7051 did not become reachable within 60 s — check container logs")
+        sys.exit(1)
+
+    # ── 3. Join peer (force-rejoin if we just recreated the channel) ───────
     #
     # When force_rejoin=True the peer's in-memory channel list may still show
     # the old (stale) channel entry, so we skip _channel_exists() and always
@@ -638,7 +754,7 @@ def setup_channel_and_chaincode():
         ok(f"peer0 already joined {CHANNEL}")
     else:
         if force_rejoin:
-            info("Force-rejoining peer0 to channel (stale ledger detected) ...")
+            info("Force-rejoining peer0 to channel (stale ledger cleared) ...")
         else:
             info("Joining peer0 to channel ...")
         rc = subprocess.call(
@@ -651,7 +767,7 @@ def setup_channel_and_chaincode():
             err(f"peer channel join failed (rc={rc}) \u2014 cannot continue")
             sys.exit(1)
 
-    # ── 3. Wait for peer deliver stream to be ready ────────────────────────
+    # ── 4. Wait for peer deliver stream to be ready ────────────────────────
     #
     # approveformyorg uses the peer's deliver service internally.  If the peer
     # ledger hasn't finished syncing block 0 from the orderer yet, it returns
@@ -662,12 +778,12 @@ def setup_channel_and_chaincode():
         err("Peer ledger did not sync within 90 s — check peer0 container logs")
         sys.exit(1)
 
-    # ── 4. If chaincode already committed, skip ALL lifecycle steps ─────────
+    # ── 5. If chaincode already committed, skip ALL lifecycle steps ─────────
     if _chaincode_committed(CHANNEL, CC_NAME, base_env):
         ok(f"Chaincode '{CC_NAME}' already committed on '{CHANNEL}' \u2014 skipping lifecycle")
         return
 
-    # ── 5. Package ─────────────────────────────────────────────────────────
+    # ── 6. Package ─────────────────────────────────────────────────────────
     pkg_tar = Path("security_logger.tar.gz")
     if not pkg_tar.exists():
         info("Packaging chaincode ...")
@@ -682,7 +798,7 @@ def setup_channel_and_chaincode():
     else:
         ok("security_logger.tar.gz already exists \u2014 skipping package")
 
-    # ── 6. Check/Install ───────────────────────────────────────────────────
+    # ── 7. Check/Install ───────────────────────────────────────────────────
     if _chaincode_installed(CC_NAME, PEER_ADDR, peer_tls_ca, base_env):
         ok("Chaincode already installed on peer0")
     else:
@@ -697,7 +813,7 @@ def setup_channel_and_chaincode():
             err(f"chaincode install failed (rc={rc}) \u2014 cannot continue")
             sys.exit(1)
 
-    # ── 7. Query package ID ────────────────────────────────────────────────
+    # ── 8. Query package ID ────────────────────────────────────────────────
     info("Querying installed chaincode ...")
     result = subprocess.run([
         "peer", "lifecycle", "chaincode", "queryinstalled",
@@ -718,14 +834,14 @@ def setup_channel_and_chaincode():
 
     ok(f"Package ID: {pkg_id}")
 
-    # ── 8. Check orderer reachability — skip approve+commit if NOT_FOUND ───
+    # ── 9. Check orderer reachability — skip approve+commit if NOT_FOUND ───
     if not _orderer_reachable(ORDERER_ADDR, orderer_tls, CHANNEL, base_env):
         warn("Orderer returned NOT_FOUND for channel \u2014 chaincode installed on peer.")
         warn("Approve+commit requires the orderer to know the channel.")
         warn("The stack will continue; services will use peer-side endorsement only.")
         return
 
-    # ── 9. Check/Approve ───────────────────────────────────────────────────
+    # ── 10. Check/Approve ──────────────────────────────────────────────────
     if _chaincode_approved(CHANNEL, CC_NAME, CC_SEQUENCE, ORDERER_ADDR, orderer_tls, base_env):
         ok("Chaincode already approved for Org1 \u2014 skipping approveformyorg")
     else:
@@ -748,7 +864,7 @@ def setup_channel_and_chaincode():
             sys.exit(1)
         ok("Chaincode approved")
 
-    # ── 10. Commit ─────────────────────────────────────────────────────────
+    # ── 11. Commit ─────────────────────────────────────────────────────────
     info("Committing chaincode ...")
     rc = subprocess.call([
         "peer", "lifecycle", "chaincode", "commit",
@@ -1048,7 +1164,7 @@ def main():
         for name, p, _, fh in procs:
             p.terminate()
             fh.close()
-            info(f"Stopped {n}")
+            info(f"Stopped {name}")
 
 
 if __name__ == "__main__":
