@@ -15,8 +15,8 @@ Pipeline per message:
      then DLQ -- never silent-drop.
 
 Fabric transport: peer CLI subprocess (no SDK, Python-3.14-safe).
-All cert/key paths are resolved from env vars set by run.py -- no
-hardcoded directory trees.
+All cert/key paths are resolved to absolute paths anchored at REPO_ROOT
+so relative values in .env work regardless of the process working dir.
 """
 from __future__ import annotations
 
@@ -36,9 +36,11 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 # Bootstrap: make shared/ importable regardless of cwd
 # ---------------------------------------------------------------------------
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
+# app.py lives at  <repo>/services/blockchain-logger/app.py
+# so REPO_ROOT     = app.py -> parent -> parent -> parent
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import redis  # type: ignore
 from confluent_kafka import Consumer, KafkaError, Producer  # type: ignore
@@ -60,43 +62,50 @@ log = logging.getLogger("blockchain-logger")
 
 
 # ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
+
+def _abs(p: str) -> str:
+    """
+    Return an absolute path string.
+    If p is already absolute, return it unchanged.
+    If p is relative, resolve it against REPO_ROOT (the project root),
+    NOT against the process cwd which varies depending on how the service
+    was launched.
+    """
+    path = Path(p)
+    if path.is_absolute():
+        return str(path)
+    return str(REPO_ROOT / path)
+
+
+# ---------------------------------------------------------------------------
 # Fabric CLI path resolution
 # ---------------------------------------------------------------------------
-# All paths are derived from env vars already set by run.py.
-# We never hardcode directory trees -- that was the source of the previous
-# "MSP directory not found" error.
-#
-# Priority for each path:
-#   1. Dedicated env var (set by run.py)  -- always wins
-#   2. Path-derived fallback from a related var that IS set
-#
-# FABRIC_CFG_PATH  -- tells the peer binary where core.yaml lives.
-#   run.py sets this to fabric-samples/config (the standard location).
-#   crypto-config is NOT under fabric-samples/config; it is under REPO_ROOT.
-_FABRIC_CFG_PATH: str = os.environ.get(
-    "FABRIC_CFG_PATH",
-    str(Path(REPO_ROOT) / "fabric-samples" / "config"),
+# All source values come from env vars set by run.py.
+# Every value is passed through _abs() so relative paths in .env work.
+
+# FABRIC_CFG_PATH -- where the peer binary finds core.yaml
+_FABRIC_CFG_PATH: str = _abs(
+    os.environ.get("FABRIC_CFG_PATH",
+                   str(REPO_ROOT / "fabric-samples" / "config"))
 )
 
-# PEER TLS CA  -- used in --tlsRootCertFiles
-#   cfg.FABRIC_TLS_CERT is set by run.py to the peer's tls/ca.crt.
-#   This is exactly the file peer CLI needs for --tlsRootCertFiles.
-_PEER_TLS_CA: str = cfg.FABRIC_TLS_CERT   # e.g. .../peerOrgs/.../tls/ca.crt
+# PEER TLS CA -- --tlsRootCertFiles argument
+# cfg.FABRIC_TLS_CERT is the peer's tls/ca.crt, set by run.py
+_PEER_TLS_CA: str = _abs(cfg.FABRIC_TLS_CERT)
 
-# ORDERER TLS CA  -- used in --cafile
-#   cfg.FABRIC_ORDERER_TLS_CERT is set by run.py when it runs lifecycle steps.
-#   Fallback: derive from PEER TLS CA by walking up to the crypto-config root
-#   and constructing the standard orderer path.
+# ORDERER TLS CA -- --cafile argument
+# Use FABRIC_ORDERER_TLS_CERT if set; otherwise derive from PEER TLS CA path.
 def _resolve_orderer_tls_ca() -> str:
     if cfg.FABRIC_ORDERER_TLS_CERT:
-        return cfg.FABRIC_ORDERER_TLS_CERT
-    # Fallback: FABRIC_TLS_CERT is something like:
-    #   <repo>/crypto-config/peerOrganizations/org1.example.com/peers/peer0.../tls/ca.crt
-    # Walk up 6 levels to reach crypto-config/, then build orderer path.
+        return _abs(cfg.FABRIC_ORDERER_TLS_CERT)
+    # Derive: FABRIC_TLS_CERT is
+    #   crypto-config/peerOrganizations/org1.example.com/peers/peer0.../tls/ca.crt
+    # parents[0]=tls  [1]=peer0...  [2]=peers  [3]=org1...  [4]=peerOrganizations  [5]=crypto-config
     try:
-        p = Path(cfg.FABRIC_TLS_CERT)
-        # p.parents: [tls/, peer0.../, peers/, org1.../, peerOrganizations/, crypto-config/]
-        crypto_root = p.parents[5]
+        peer_ca = Path(_PEER_TLS_CA)  # already absolute
+        crypto_root = peer_ca.parents[5]
         return str(
             crypto_root
             / "ordererOrganizations"
@@ -108,62 +117,61 @@ def _resolve_orderer_tls_ca() -> str:
             / "tlsca.example.com-cert.pem"
         )
     except Exception:
-        # Last-resort: same directory as peer TLS CA, two orgs over
-        return str(Path(cfg.FABRIC_TLS_CERT).parent / "ca.crt")
+        return str(Path(_PEER_TLS_CA).parent / "ca.crt")
 
 _ORDERER_TLS_CA: str = _resolve_orderer_tls_ca()
 
-# ADMIN MSP PATH  -- used in CORE_PEER_MSPCONFIGPATH
-#   Must be the Admin USER msp directory, NOT the peer node msp.
-#   cfg.FABRIC_ADMIN_MSP_PATH is set by run.py for lifecycle steps.
-#   Fallback: FABRIC_SIGN_CERT is the admin's signing cert, so its
-#   grandparent directory is the msp/ folder we need.
+# ADMIN MSP PATH -- CORE_PEER_MSPCONFIGPATH
+# Must be the ADMIN USER msp/ directory (not the peer node msp/).
+# Source priority:
+#   1. FABRIC_ADMIN_MSP_PATH env var (explicit, set by some run.py variants)
+#   2. Derive from FABRIC_SIGN_CERT: the admin signing cert lives at
+#      msp/signcerts/cert.pem, so parent.parent == msp/
 def _resolve_admin_msp() -> str:
     if cfg.FABRIC_ADMIN_MSP_PATH:
-        return cfg.FABRIC_ADMIN_MSP_PATH
-    # FABRIC_SIGN_CERT e.g. .../users/Admin@org1.../msp/signcerts/cert.pem
+        return _abs(cfg.FABRIC_ADMIN_MSP_PATH)
+    # FABRIC_SIGN_CERT e.g.:
+    #   crypto-config/peerOrganizations/org1.example.com/users/Admin@org1.example.com/msp/signcerts/cert.pem
     # parent      = signcerts/
-    # parent.parent = msp/   <-- this is what peer CLI needs
-    return str(Path(cfg.FABRIC_SIGN_CERT).parent.parent)
+    # parent.parent = msp/   <-- exactly what CORE_PEER_MSPCONFIGPATH needs
+    sign_cert = Path(_abs(cfg.FABRIC_SIGN_CERT))
+    return str(sign_cert.parent.parent)
 
 _ADMIN_MSP_PATH: str = _resolve_admin_msp()
 
 
 def _log_fabric_paths() -> None:
-    """Emit resolved paths at startup so mismatches are immediately visible."""
-    log.info("Fabric CLI paths:")
-    log.info("  FABRIC_CFG_PATH       = %s  exists=%s", _FABRIC_CFG_PATH,
-             Path(_FABRIC_CFG_PATH).exists())
-    log.info("  PEER_TLS_CA           = %s  exists=%s", _PEER_TLS_CA,
-             Path(_PEER_TLS_CA).exists())
-    log.info("  ORDERER_TLS_CA        = %s  exists=%s", _ORDERER_TLS_CA,
-             Path(_ORDERER_TLS_CA).exists())
-    log.info("  ADMIN_MSP_PATH        = %s  exists=%s", _ADMIN_MSP_PATH,
-             Path(_ADMIN_MSP_PATH).exists())
-    log.info("  FABRIC_PEER_ENDPOINT  = %s", cfg.FABRIC_PEER_ENDPOINT)
-    log.info("  FABRIC_MSP_ID         = %s", cfg.FABRIC_MSP_ID)
-    log.info("  FABRIC_CHANNEL        = %s", cfg.FABRIC_CHANNEL)
-    log.info("  FABRIC_CHAINCODE      = %s", cfg.FABRIC_CHAINCODE)
+    """Print resolved absolute paths + existence at startup."""
+    log.info("Fabric CLI paths (all absolute):")
+    for label, p in [
+        ("FABRIC_CFG_PATH  ", _FABRIC_CFG_PATH),
+        ("PEER_TLS_CA      ", _PEER_TLS_CA),
+        ("ORDERER_TLS_CA   ", _ORDERER_TLS_CA),
+        ("ADMIN_MSP_PATH   ", _ADMIN_MSP_PATH),
+    ]:
+        log.info("  %s = %s  exists=%s", label, p, Path(p).exists())
+    log.info("  FABRIC_PEER_ENDPOINT = %s", cfg.FABRIC_PEER_ENDPOINT)
+    log.info("  FABRIC_MSP_ID        = %s", cfg.FABRIC_MSP_ID)
+    log.info("  FABRIC_CHANNEL       = %s", cfg.FABRIC_CHANNEL)
+    log.info("  FABRIC_CHAINCODE     = %s", cfg.FABRIC_CHAINCODE)
 
 
 def _peer_env() -> dict:
-    """Environment dict for every `peer` subprocess call."""
+    """Environment dict passed to every `peer` subprocess call."""
     env = os.environ.copy()
-    env["FABRIC_CFG_PATH"]              = _FABRIC_CFG_PATH
-    env["CORE_PEER_TLS_ENABLED"]        = "true"
-    env["CORE_PEER_LOCALMSPID"]         = cfg.FABRIC_MSP_ID
-    env["CORE_PEER_ADDRESS"]            = cfg.FABRIC_PEER_ENDPOINT
-    env["CORE_PEER_MSPCONFIGPATH"]      = _ADMIN_MSP_PATH
-    env["CORE_PEER_TLS_ROOTCERT_FILE"]  = _PEER_TLS_CA
+    env["FABRIC_CFG_PATH"]             = _FABRIC_CFG_PATH
+    env["CORE_PEER_TLS_ENABLED"]       = "true"
+    env["CORE_PEER_LOCALMSPID"]        = cfg.FABRIC_MSP_ID
+    env["CORE_PEER_ADDRESS"]           = cfg.FABRIC_PEER_ENDPOINT
+    env["CORE_PEER_MSPCONFIGPATH"]     = _ADMIN_MSP_PATH
+    env["CORE_PEER_TLS_ROOTCERT_FILE"] = _PEER_TLS_CA
     return env
 
 
 def _submit_to_fabric(event: SecurityEvent) -> str:
     """
-    Invoke the LogEvent chaincode function via `peer chaincode invoke`.
-
-    Returns the tx-id string (parsed from peer output, or a sha256 fingerprint
-    fallback). Raises RuntimeError on non-zero peer exit so the caller retries.
+    Invoke LogEvent chaincode via `peer chaincode invoke`.
+    Returns tx-id string. Raises RuntimeError on failure (caller retries).
     """
     payload_str = json.dumps(event.to_ledger_dict(), default=str)
     invoke_spec = json.dumps({"Args": ["LogEvent", payload_str]})
@@ -228,11 +236,11 @@ def _load_agent_key():
     global _agent_private_key, _agent_identity
     if _agent_private_key is not None:
         return
-    with open(cfg.AGENT_KEY_PATH, "rb") as f:
+    with open(_abs(cfg.AGENT_KEY_PATH), "rb") as f:
         _agent_private_key = serialization.load_pem_private_key(
             f.read(), password=None, backend=default_backend()
         )
-    with open(cfg.AGENT_CERT_PATH, "rb") as f:
+    with open(_abs(cfg.AGENT_CERT_PATH), "rb") as f:
         cert_pem = f.read()
     from cryptography import x509
     cert = x509.load_pem_x509_certificate(cert_pem, default_backend())
@@ -294,10 +302,6 @@ def _send_to_dlq(raw: bytes, reason: str) -> None:
 # -- Core pipeline ------------------------------------------------------------
 
 def process_message(raw: bytes) -> None:
-    """
-    Full pipeline for one Kafka message. Raises on unrecoverable error
-    so the caller routes to DLQ. Transient errors are retried by main().
-    """
     try:
         event = SecurityEvent.from_kafka_bytes(raw)
     except Exception as exc:
@@ -329,34 +333,35 @@ def process_message(raw: bytes) -> None:
 # -- Main consumer loop -------------------------------------------------------
 
 def main() -> None:
-    log.info("blockchain-logger starting  config=%s", cfg.dump())
-    _log_fabric_paths()   # print resolved paths + exists checks before first invoke
+    log.info("blockchain-logger starting  REPO_ROOT=%s", REPO_ROOT)
+    _log_fabric_paths()
 
     if not shutil.which("peer"):
-        log.error("'peer' binary not found on PATH -- add fabric-samples/bin to PATH")
+        log.error("'peer' binary not found on PATH")
         sys.exit(1)
 
-    # Abort early if any critical path is missing
     missing = [
         p for p in [_PEER_TLS_CA, _ORDERER_TLS_CA, _ADMIN_MSP_PATH]
         if not Path(p).exists()
     ]
     if missing:
-        log.error("Critical Fabric paths do not exist on disk:")
+        log.error("Critical Fabric paths missing on disk:")
         for p in missing:
             log.error("  MISSING: %s", p)
-        log.error("Check FABRIC_TLS_CERT, FABRIC_ORDERER_TLS_CERT, "
-                  "FABRIC_ADMIN_MSP_PATH, FABRIC_SIGN_CERT in your .env")
+        log.error(
+            "Tip: ensure FABRIC_TLS_CERT, FABRIC_SIGN_CERT (and optionally "
+            "FABRIC_ORDERER_TLS_CERT, FABRIC_ADMIN_MSP_PATH) in .env point "
+            "to the correct files under crypto-config/. Relative paths are "
+            "resolved against the repo root: %s", REPO_ROOT
+        )
         sys.exit(1)
 
-    consumer = Consumer(
-        {
-            "bootstrap.servers":  cfg.KAFKA_BOOTSTRAP_SERVERS,
-            "group.id":           cfg.KAFKA_CONSUMER_GROUP,
-            "auto.offset.reset":  "earliest",
-            "enable.auto.commit": "false",
-        }
-    )
+    consumer = Consumer({
+        "bootstrap.servers":  cfg.KAFKA_BOOTSTRAP_SERVERS,
+        "group.id":           cfg.KAFKA_CONSUMER_GROUP,
+        "auto.offset.reset":  "earliest",
+        "enable.auto.commit": "false",
+    })
     consumer.subscribe([cfg.KAFKA_TOPIC_EVENTS])
     log.info("Subscribed to topic %s", cfg.KAFKA_TOPIC_EVENTS)
 
@@ -364,7 +369,7 @@ def main() -> None:
 
     def _stop(sig, frame):  # type: ignore
         nonlocal _running
-        log.info("Signal %s received -- shutting down", sig)
+        log.info("Signal %s -- shutting down", sig)
         _running = False
 
     signal.signal(signal.SIGTERM, _stop)
@@ -405,7 +410,7 @@ def main() -> None:
                     log.info("Retrying in %.1f s ...", sleep_s)
                     time.sleep(sleep_s)
                 else:
-                    log.error("All %d retries exhausted -- sending to DLQ", max_retries)
+                    log.error("All %d retries exhausted -- DLQ", max_retries)
                     _send_to_dlq(raw, f"max retries exceeded: {exc}")
                     succeeded = True
 
