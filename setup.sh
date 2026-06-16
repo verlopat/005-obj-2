@@ -20,8 +20,7 @@ for d in \
     fi
 done
 
-which peer   >/dev/null 2>&1 || err "'peer' not found — install Fabric binaries first:
-  curl -sSL https://bit.ly/2ysbOFE | bash -s -- 2.5.0 1.5.7"
+which peer   >/dev/null 2>&1 || err "'peer' not found — install Fabric binaries first:\n  curl -sSL https://bit.ly/2ysbOFE | bash -s -- 2.5.0 1.5.7"
 which cryptogen  >/dev/null 2>&1 || err "'cryptogen' not found"
 which configtxgen>/dev/null 2>&1 || err "'configtxgen' not found"
 ok "Fabric binaries OK"
@@ -46,7 +45,6 @@ PEER0_SIGN_KEY="$PEER_ORG/peers/peer0.org1.example.com/msp/keystore/priv_sk"
 add_env() {
     local key="$1" val="$2"
     if grep -q "^${key}=" .env 2>/dev/null; then
-        # already set — overwrite to ensure correct value
         sed -i "s|^${key}=.*|${key}=${val}|" .env
     else
         echo "${key}=${val}" >> .env
@@ -73,24 +71,17 @@ source .env
 set +o allexport
 ok "Environment variables exported into current shell"
 
-# ── 4. Python venv ────────────────────────────────────────────────────────────
-if [ ! -d .venv ]; then
-    info "Creating Python venv ..."
-    python3 -m venv .venv
-    ok ".venv created"
-else
-    ok ".venv already exists"
-fi
-
-source .venv/bin/activate
-pip install --upgrade pip -q
+# ── 4. Python dependencies ────────────────────────────────────────────────────
+info "Upgrading pip ..."
+python3 -m pip install --upgrade pip -q
+ok "pip upgraded"
 
 for req in $(find services -name requirements.txt); do
     info "Installing $req ..."
-    pip install -r "$req" -q
+    python3 -m pip install -r "$req" -q
 done
 
-pip install requests -q   # needed by run.py benchmark
+python3 -m pip install requests -q   # needed by run.py benchmark
 ok "All Python dependencies installed"
 
 # ── 5. Summary ────────────────────────────────────────────────────────────────
