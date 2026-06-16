@@ -119,7 +119,6 @@ def ensure_venv():
         _make_venv()
 
     venv_python = _venv_python_path()
-    venv_pip    = _venv_pip_path()
 
     if not venv_python.exists():
         raise RuntimeError(
@@ -127,18 +126,25 @@ def ensure_venv():
             f"Run manually:  rm -rf {VENV_DIR} && python3 -m venv {VENV_DIR}"
         )
 
-    subprocess.call([str(venv_pip), "install", "--upgrade", "pip", "-q"])
+    # Use "python -m pip" instead of the pip3/pip binary — the binary symlink
+    # is not guaranteed to exist in all Python versions (e.g. Python 3.14 on
+    # Arch Linux only creates "pip", not "pip3", and only after ensurepip runs).
+    # "python -m pip" always works as long as pip is installed in the venv.
+    subprocess.call([str(venv_python), "-m", "pip", "install", "--upgrade", "pip", "-q"])
 
     for req in sorted(Path("services").rglob("requirements.txt")):
         info(f"Installing {req} into .venv ...")
-        result = subprocess.call([str(venv_pip), "install", "-r", str(req), "-q"])
+        result = subprocess.call(
+            [str(venv_python), "-m", "pip", "install", "-r", str(req), "-q"]
+        )
         if result == 0:
             ok(f"  {req} \u2014 done")
         else:
             warn(f"  {req} \u2014 some packages failed (check manually)")
 
     ok(f"Using venv python: {venv_python}")
-    return str(venv_python), str(venv_pip)
+    # Return venv_python twice for API compat (callers unpack as venv_python, _)
+    return str(venv_python), str(venv_python)
 
 
 # ============================================================
