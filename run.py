@@ -15,6 +15,7 @@ missing or a service fails to start, the runner exits with a non-zero code.
 """
 
 import argparse
+import datetime as _dt
 import json
 import os
 import platform
@@ -560,6 +561,83 @@ def check_prereqs() -> bool:
 
 
 # ============================================================
+# Agent keypair generation
+# ============================================================
+
+def _generate_agent_keypair():
+    """
+    Generate a P-256 ECDSA keypair for the blockchain-logger agent identity.
+
+    Writes:
+      crypto-config/agent/keystore/agent_sk    — PEM private key (PKCS8)
+      crypto-config/agent/signcerts/agent.pem  — PEM self-signed X.509 cert
+
+    Skips silently if both files already exist.
+    """
+    key_path  = Path("crypto-config/agent/keystore/agent_sk")
+    cert_path = Path("crypto-config/agent/signcerts/agent.pem")
+
+    if key_path.exists() and cert_path.exists():
+        ok("Agent keypair already exists — skipping")
+        return
+
+    info("Generating agent EC keypair (P-256) ...")
+
+    try:
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+    except ImportError:
+        # cryptography may not be installed in the system Python yet;
+        # install it quietly and retry.
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "cryptography", "-q"]
+        )
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+
+    # Generate private key
+    private_key = ec.generate_private_key(ec.SECP256R1())
+
+    # Build a minimal self-signed certificate (valid 10 years)
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, "audit-agent"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Org1MSP"),
+    ])
+    now = _dt.datetime.now(_dt.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(private_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + _dt.timedelta(days=3650))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .sign(private_key, hashes.SHA256())
+    )
+
+    # Write key
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    key_path.write_bytes(
+        private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+
+    # Write cert
+    cert_path.parent.mkdir(parents=True, exist_ok=True)
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+
+    ok(f"Agent keypair written → {key_path}  /  {cert_path}")
+
+
+# ============================================================
 # 2. CRYPTO + GENESIS
 # ============================================================
 
@@ -615,6 +693,9 @@ PeerOrgs:
         ok("security-channel.tx created")
     else:
         ok("security-channel.tx already exists \u2014 skipping")
+
+    # Generate the agent keypair used by blockchain-logger for ECDSA signing
+    _generate_agent_keypair()
 
 
 # ============================================================
