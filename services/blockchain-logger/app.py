@@ -1,39 +1,41 @@
 """
 services/blockchain-logger/app.py
 
-Kafka → IPFS → Hyperledger Fabric → Redis pipeline.
+Kafka -> IPFS -> Hyperledger Fabric -> Redis pipeline.
 
 Pipeline per message:
   1. Validate event against shared SecurityEvent schema.
-  2. Pin canonical payload to IPFS — get real CID.
+  2. Pin canonical payload to IPFS -- get real CID.
   3. Compute SHA-256 over canonical payload bytes.
   4. Sign (canonical_bytes) with ECDSA P-256 agent key.
-  5. Submit chaincode Invoke (LogEvent) via Fabric Gateway gRPC.
+  5. Submit chaincode Invoke (LogEvent) via `peer chaincode invoke` CLI.
   6. Write committed record to Redis (shared with audit-api).
   7. Commit Kafka offset ONLY after all steps succeed.
   8. On any failure: bounded retries with exponential backoff,
-     then DLQ — never silent-drop.
+     then DLQ -- never silent-drop.
 
-No mock paths.  If a required env var is missing the process exits at startup.
-
-Fabric SDK: hyperledger/fabric-gateway (fabric-gateway PyPI package)
-  - Replaces the unmaintained fabric_sdk_py which does not build on Python 3.10+.
-  - Pure-protobuf gRPC transport; no compiled C-extension ABI issues.
+Fabric transport: peer CLI subprocess (no SDK, Python-3.14-safe).
+The `peer` binary is already on PATH (verified by run.py Step 1).
+All cert/key paths come from shared.config which reads them from env vars.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import shutil
 import signal
+import subprocess
 import sys
 import time
 import traceback
+from pathlib import Path
 from typing import Optional
 
-# ─────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Bootstrap: make shared/ importable regardless of cwd
-# ─────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
@@ -48,7 +50,7 @@ from shared import config as cfg
 from shared.event_schema import SecurityEvent
 from shared.ipfs_client import IPFSError, add_and_pin, fetch_and_verify
 
-# ── Logging ───────────────────────────────────────────────────────────────────────────────
+# -- Logging -----------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [logger] %(levelname)s %(message)s",
@@ -57,113 +59,127 @@ logging.basicConfig(
 log = logging.getLogger("blockchain-logger")
 
 
-# ── Fabric Gateway helpers (fabric-gateway PyPI package) ───────────────────────────
-#
-# The fabric-gateway package (https://pypi.org/project/fabric-gateway/) is the
-# official Hyperledger Fabric Gateway SDK for Python.  It replaced fabric_sdk_py
-# and works on Python 3.10+.  Import path: fabric_gateway.fabric.gateway
-#
-# Connection model:
-#   grpc.Channel  →  Gateway(channel, signer, certificate)  →  network  →  contract
-#
-# The Gateway object is reused across messages (lazy init via _get_contract).
-# On any gRPC error the cached objects are discarded so the next call rebuilds.
+# ---------------------------------------------------------------------------
+# Fabric: peer CLI transport
+# ---------------------------------------------------------------------------
+# We shell out to `peer chaincode invoke` instead of using any Python SDK.
+# fabric_sdk_py and fabric-gateway both depend on grpcio compiled wheels that
+# are not published for Python 3.14. The peer binary is already on PATH and
+# already verified by run.py Step 1.
 
-import grpc  # type: ignore
+_FABRIC_CFG_PATH: str = os.environ.get(
+    "FABRIC_CFG_PATH",
+    str(Path(REPO_ROOT) / "fabric-samples" / "config"),
+)
 
-_channel: Optional[grpc.Channel] = None
-_contract = None  # fabric_gateway Contract object
+# Peer TLS CA -- used for --tlsRootCertFiles on invoke
+_PEER_TLS_CA: str = str(
+    Path(REPO_ROOT)
+    / "crypto-config"
+    / "peerOrganizations"
+    / "org1.example.com"
+    / "peers"
+    / "peer0.org1.example.com"
+    / "tls"
+    / "ca.crt"
+)
 
-
-def _load_pem(path: str) -> bytes:
-    with open(path, "rb") as f:
-        return f.read()
-
-
-def _build_fabric_gateway():
-    """
-    Build a Fabric Gateway Contract using the official fabric-gateway SDK.
-
-    Returns (gateway_obj, contract) where contract exposes submit_transaction().
-    """
-    from fabric_gateway.fabric.gateway import Gateway  # type: ignore
-    import hashlib
-
-    tls_root_cert_pem = _load_pem(cfg.FABRIC_TLS_CERT)
-    sign_cert_pem     = _load_pem(cfg.FABRIC_SIGN_CERT)
-    sign_key_pem      = _load_pem(cfg.FABRIC_SIGN_KEY)
-
-    # Load signing private key
-    private_key = serialization.load_pem_private_key(
-        sign_key_pem, password=None, backend=default_backend()
-    )
-
-    # gRPC secure channel
-    creds = grpc.ssl_channel_credentials(root_certificates=tls_root_cert_pem)
-    channel = grpc.secure_channel(cfg.FABRIC_PEER_ENDPOINT, creds)
-
-    # Signer: a callable that takes bytes and returns DER-encoded ECDSA signature
-    def _signer(data: bytes) -> bytes:
-        return private_key.sign(data, ec.ECDSA(hashes.SHA256()))
-
-    gateway = Gateway(
-        channel,
-        signer=_signer,
-        certificate=sign_cert_pem,
-        msp_id=cfg.FABRIC_MSP_ID,
-    )
-    network  = gateway.get_network(cfg.FABRIC_CHANNEL)
-    contract = network.get_contract(cfg.FABRIC_CHAINCODE)
-    return gateway, channel, contract
+# Orderer TLS CA -- used for --cafile on invoke
+_ORDERER_TLS_CA: str = str(
+    Path(REPO_ROOT)
+    / "crypto-config"
+    / "ordererOrganizations"
+    / "example.com"
+    / "orderers"
+    / "orderer.example.com"
+    / "msp"
+    / "tlscacerts"
+    / "tlsca.example.com-cert.pem"
+)
 
 
-_gateway_obj  = None
-_grpc_channel = None
+def _admin_msp_path() -> str:
+    # FABRIC_SIGN_CERT is e.g. .../users/Admin@org1.example.com/msp/signcerts/cert.pem
+    # Walk up two levels to reach the msp/ directory.
+    return str(Path(cfg.FABRIC_SIGN_CERT).parent.parent)
 
 
-def _get_contract():
-    global _gateway_obj, _grpc_channel, _contract
-    if _contract is None:
-        _gateway_obj, _grpc_channel, _contract = _build_fabric_gateway()
-        log.info("Fabric Gateway connected  peer=%s  channel=%s  cc=%s",
-                 cfg.FABRIC_PEER_ENDPOINT, cfg.FABRIC_CHANNEL, cfg.FABRIC_CHAINCODE)
-    return _contract
-
-
-def _reset_fabric_connection():
-    """Discard cached connection so the next call to _get_contract() rebuilds."""
-    global _gateway_obj, _grpc_channel, _contract
-    try:
-        if _grpc_channel:
-            _grpc_channel.close()
-    except Exception:
-        pass
-    _gateway_obj  = None
-    _grpc_channel = None
-    _contract     = None
+def _peer_env() -> dict:
+    """Environment dict for every `peer` subprocess call."""
+    env = os.environ.copy()
+    env["FABRIC_CFG_PATH"]              = _FABRIC_CFG_PATH
+    env["CORE_PEER_TLS_ENABLED"]        = "true"
+    env["CORE_PEER_LOCALMSPID"]         = cfg.FABRIC_MSP_ID
+    env["CORE_PEER_ADDRESS"]            = cfg.FABRIC_PEER_ENDPOINT
+    env["CORE_PEER_MSPCONFIGPATH"]      = _admin_msp_path()
+    env["CORE_PEER_TLS_ROOTCERT_FILE"]  = _PEER_TLS_CA
+    return env
 
 
 def _submit_to_fabric(event: SecurityEvent) -> str:
     """
-    Submit a LogEvent transaction and return the tx_id string.
-    Raises RuntimeError if the submission fails.
-    Resets the connection cache on gRPC-level errors so callers can retry.
+    Invoke the LogEvent chaincode function via `peer chaincode invoke`.
+
+    Returns the tx-id string (parsed from peer output, or a sha256 fingerprint
+    fallback). Raises RuntimeError on non-zero peer exit so the caller retries.
     """
-    try:
-        contract = _get_contract()
-        payload  = json.dumps(event.to_ledger_dict(), default=str)
-        # submit_transaction blocks until the peer has committed the block.
-        # Returns bytes (tx_id).
-        result = contract.submit_transaction("LogEvent", payload)
-        tx_id  = result.decode() if isinstance(result, bytes) else str(result)
-        return tx_id
-    except Exception as exc:
-        # Reset so the next retry builds a fresh channel/gateway
-        _reset_fabric_connection()
-        raise
+    payload_str  = json.dumps(event.to_ledger_dict(), default=str)
+    invoke_spec  = json.dumps({"Args": ["LogEvent", payload_str]})
+
+    cmd = [
+        "peer", "chaincode", "invoke",
+        "-o",  "orderer.example.com:7050",
+        "--ordererTLSHostnameOverride", "orderer.example.com",
+        "--tls",
+        "--cafile",           _ORDERER_TLS_CA,
+        "-C",                 cfg.FABRIC_CHANNEL,
+        "-n",                 cfg.FABRIC_CHAINCODE,
+        "-c",                 invoke_spec,
+        "--peerAddresses",    cfg.FABRIC_PEER_ENDPOINT,
+        "--tlsRootCertFiles", _PEER_TLS_CA,
+        "--waitForEvent",
+        "--waitForEventTimeout", f"{cfg.FABRIC_INVOKE_TIMEOUT_S}s",
+    ]
+
+    result = subprocess.run(
+        cmd,
+        env=_peer_env(),
+        capture_output=True,
+        text=True,
+        timeout=cfg.FABRIC_INVOKE_TIMEOUT_S + 10,
+    )
+
+    combined = result.stdout + result.stderr
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"peer chaincode invoke failed (rc={result.returncode}): "
+            f"{result.stderr.strip()[:400]}"
+        )
+
+    # Parse real tx-id from peer output: "...txid [<txid>] committed..."
+    tx_id = ""
+    for line in combined.splitlines():
+        low = line.lower()
+        if "txid" in low and "[" in line:
+            try:
+                start = line.index("[") + 1
+                end   = line.index("]", start)
+                tx_id = line[start:end].strip()
+                break
+            except ValueError:
+                pass
+
+    if not tx_id:
+        # Deterministic fallback: sha256 of the payload
+        tx_id = "cli-" + hashlib.sha256(payload_str.encode()).hexdigest()[:32]
+
+    log.debug("peer invoke stdout: %s", result.stdout.strip()[:200])
+    log.debug("peer invoke stderr: %s", result.stderr.strip()[:200])
+    return tx_id
 
 
-# ── ECDSA signing (agent identity) ─────────────────────────────────────────────────────
+# -- ECDSA signing (agent identity) ------------------------------------------
 _agent_private_key: Optional[ec.EllipticCurvePrivateKey] = None
 _agent_identity: Optional[str] = None
 
@@ -189,19 +205,19 @@ def _sign(data: bytes) -> str:
     return sig.hex()
 
 
-# ── Redis helpers ──────────────────────────────────────────────────────────────────────────
-_redis: Optional[redis.Redis] = None
+# -- Redis helpers ------------------------------------------------------------
+_redis_client: Optional[redis.Redis] = None
 
 
 def _get_redis() -> redis.Redis:
-    global _redis
-    if _redis is None:
-        _redis = redis.from_url(cfg.REDIS_URL, decode_responses=True)
-    return _redis
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis.from_url(cfg.REDIS_URL, decode_responses=True)
+    return _redis_client
 
 
 def _write_to_redis(event: SecurityEvent) -> None:
-    r = _get_redis()
+    r        = _get_redis()
     event_id = str(event.event_id)
     key      = cfg.REDIS_KEY_PREFIX + event_id
     record   = json.dumps(event.to_ledger_dict(), default=str)
@@ -209,13 +225,13 @@ def _write_to_redis(event: SecurityEvent) -> None:
     pipe = r.pipeline()
     pipe.set(key, record, ex=cfg.REDIS_TTL_S)
     ts = event.timestamp.timestamp()
-    pipe.zadd(cfg.REDIS_IDX_ASSET + event.asset_id, {event_id: ts})
+    pipe.zadd(cfg.REDIS_IDX_ASSET + event.asset_id,       {event_id: ts})
     pipe.zadd(cfg.REDIS_IDX_SEV   + event.severity.value, {event_id: ts})
     pipe.execute()
     log.info("Redis write OK  event_id=%s", event_id)
 
 
-# ── DLQ producer ────────────────────────────────────────────────────────────────────────────
+# -- DLQ producer -------------------------------------------------------------
 _dlq_producer: Optional[Producer] = None
 
 
@@ -235,14 +251,14 @@ def _send_to_dlq(raw: bytes, reason: str) -> None:
     log.error("DLQ: sent message  reason=%s", reason)
 
 
-# ── Core pipeline ─────────────────────────────────────────────────────────────────────────
+# -- Core pipeline ------------------------------------------------------------
 
 def process_message(raw: bytes) -> None:
     """
-    Full pipeline for one Kafka message.  Raises on unrecoverable error
-    so the caller can route to DLQ.  Transient errors are retried.
+    Full pipeline for one Kafka message. Raises on unrecoverable error
+    so the caller can route to DLQ. Transient errors are retried.
     """
-    # Step 1 — parse & validate schema
+    # Step 1 -- parse & validate schema
     try:
         event = SecurityEvent.from_kafka_bytes(raw)
     except Exception as exc:
@@ -251,38 +267,42 @@ def process_message(raw: bytes) -> None:
     log.info("Processing event_id=%s asset=%s severity=%s",
              event.event_id, event.asset_id, event.severity.value)
 
-    # Step 2 — build canonical payload bytes
+    # Step 2 -- build canonical payload bytes
     payload_bytes = event.canonical_bytes()
 
-    # Step 3 — add + pin to IPFS, get real CID
+    # Step 3 -- add + pin to IPFS, get real CID
     cid, sha256_hex = add_and_pin(payload_bytes)
     event.ipfs_cid = cid
     event.sha256   = sha256_hex
 
-    # Step 4 — verify IPFS round-trip before writing to chain
+    # Step 4 -- verify IPFS round-trip before writing to chain
     if not fetch_and_verify(cid, sha256_hex):
         raise IPFSError(f"IPFS round-trip verify failed for CID {cid}")
 
-    # Step 5 — sign canonical payload with agent key
+    # Step 5 -- sign canonical payload with agent key
     _load_agent_key()
     event.agent_identity  = _agent_identity
     event.agent_signature = _sign(payload_bytes)
 
-    # Step 6 — submit to Fabric (blocks until block committed)
+    # Step 6 -- submit to Fabric via peer CLI (blocks until committed)
     tx_id       = _submit_to_fabric(event)
     event.tx_id = tx_id
     log.info("Fabric commit OK  tx_id=%s  event_id=%s", tx_id, event.event_id)
 
-    # Step 7 — write committed record to Redis (shared cache for audit-api)
+    # Step 7 -- write committed record to Redis (shared cache for audit-api)
     _write_to_redis(event)
 
-    # Step 8 — offset is committed by the caller after this returns without error
+    # Step 8 -- offset committed by caller after this returns without error
 
 
-# ── Main consumer loop ────────────────────────────────────────────────────────────────────────
+# -- Main consumer loop -------------------------------------------------------
 
 def main() -> None:
     log.info("blockchain-logger starting  config=%s", cfg.dump())
+
+    if not shutil.which("peer"):
+        log.error("'peer' binary not found on PATH -- add fabric-samples/bin to PATH")
+        sys.exit(1)
 
     consumer = Consumer(
         {
@@ -299,7 +319,7 @@ def main() -> None:
 
     def _stop(sig, frame):  # type: ignore
         nonlocal _running
-        log.info("Signal %s received — shutting down", sig)
+        log.info("Signal %s received -- shutting down", sig)
         _running = False
 
     signal.signal(signal.SIGTERM, _stop)
@@ -327,10 +347,9 @@ def main() -> None:
                 succeeded = True
                 break
             except ValueError as exc:
-                # Unrecoverable: schema/parse error — go straight to DLQ
                 log.error("Unrecoverable error (attempt %d): %s", attempt, exc)
                 _send_to_dlq(raw, str(exc))
-                succeeded = True  # mark as handled (no offset stall)
+                succeeded = True
                 break
             except Exception as exc:
                 log.warning(
@@ -343,11 +362,9 @@ def main() -> None:
                     log.info("Retrying in %.1f s ...", sleep_s)
                     time.sleep(sleep_s)
                 else:
-                    log.error(
-                        "All %d retries exhausted — sending to DLQ", max_retries
-                    )
+                    log.error("All %d retries exhausted -- sending to DLQ", max_retries)
                     _send_to_dlq(raw, f"max retries exceeded: {exc}")
-                    succeeded = True  # handled via DLQ
+                    succeeded = True
 
         if succeeded:
             consumer.commit(message=msg, asynchronous=False)
@@ -355,7 +372,6 @@ def main() -> None:
                       msg.partition(), msg.offset())
 
     consumer.close()
-    _reset_fabric_connection()
     log.info("blockchain-logger stopped")
 
 
