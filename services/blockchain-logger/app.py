@@ -132,22 +132,45 @@ _ADMIN_MSP_PATH: str = _resolve_admin_msp()
 # Orderer address (no hardcoding)
 _ORDERER_ADDR: str = cfg.FABRIC_ORDERER_ENDPOINT  # e.g. orderer.example.com:7050
 
-# ---- Hardcoded path to `peer` binary ----
-# This is the ABSOLUTE path that should work regardless of the process environment.
-# We define it as a constant for easy adjustment.
-PEER_BIN = "/home/varamm/Personal/d-study/Papers/pakkodivi/Progress/005_phd/code/005-obj-2/fabric-samples/bin/peer"
+# ---------------------------------------------------------------------------
+# Peer binary resolution — env-var driven, no hardcoded personal paths
+# ---------------------------------------------------------------------------
+# Resolution order:
+#   1. FABRIC_BIN_DIR env var  (set by run.py via inject_fabric_bin_into_path())
+#   2. repo-local fabric-samples/bin/
+#   3. shutil.which("peer") — system PATH fallback
 
-# Fallback: if the hardcoded path doesn't exist, try to find `peer` in the system PATH.
-if not os.path.exists(PEER_BIN) or not os.access(PEER_BIN, os.X_OK):
+def _resolve_peer_bin() -> str:
+    # 1. FABRIC_BIN_DIR (injected by run.py)
+    bin_dir = os.environ.get("FABRIC_BIN_DIR", "").strip()
+    if bin_dir:
+        candidate = Path(bin_dir) / "peer"
+        if candidate.exists() and os.access(str(candidate), os.X_OK):
+            return str(candidate)
+
+    # 2. Repo-relative fabric-samples/bin/
+    repo_candidate = REPO_ROOT / "fabric-samples" / "bin" / "peer"
+    if repo_candidate.exists() and os.access(str(repo_candidate), os.X_OK):
+        return str(repo_candidate)
+
+    # 3. PATH fallback
     found = shutil.which("peer")
     if found:
-        PEER_BIN = found
-        log.warning("Hardcoded peer not found, using PATH: %s", PEER_BIN)
-    else:
-        log.error("No peer binary found anywhere. Set PEER_BIN to correct path.")
-        sys.exit(1)
-else:
-    log.info("Using peer binary: %s", PEER_BIN)
+        return found
+
+    return ""
+
+
+PEER_BIN = _resolve_peer_bin()
+
+if not PEER_BIN:
+    log.error(
+        "No peer binary found. Set FABRIC_BIN_DIR=/path/to/fabric-samples/bin "
+        "in .env or add fabric-samples/bin to PATH."
+    )
+    sys.exit(1)
+
+log.info("Using peer binary: %s", PEER_BIN)
 
 
 def _log_fabric_paths() -> None:
@@ -411,7 +434,10 @@ def main() -> None:
                 break
             except ValueError as exc:
                 log.error("Unrecoverable (attempt %d): %s", attempt, exc)
-                _send_to_dlq(raw, str(exc))
+                try:
+                    _send_to_dlq(raw, str(exc))
+                except Exception as dlq_exc:
+                    log.error("DLQ write also failed: %s", dlq_exc)
                 succeeded = True
                 break
             except Exception as exc:
@@ -424,7 +450,10 @@ def main() -> None:
                     time.sleep(sleep_s)
                 else:
                     log.error("All %d retries exhausted -- DLQ", max_retries)
-                    _send_to_dlq(raw, f"max retries exceeded: {exc}")
+                    try:
+                        _send_to_dlq(raw, f"max retries exceeded: {exc}")
+                    except Exception as dlq_exc:
+                        log.error("DLQ write also failed: %s", dlq_exc)
                     succeeded = True
 
         if succeeded:
