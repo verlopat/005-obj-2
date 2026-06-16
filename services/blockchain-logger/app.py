@@ -15,8 +15,8 @@ Pipeline per message:
      then DLQ -- never silent-drop.
 
 Fabric transport: peer CLI subprocess (no SDK, Python-3.14-safe).
-The `peer` binary is already on PATH (verified by run.py Step 1).
-All cert/key paths come from shared.config which reads them from env vars.
+All cert/key paths are resolved from env vars set by run.py -- no
+hardcoded directory trees.
 """
 from __future__ import annotations
 
@@ -60,48 +60,90 @@ log = logging.getLogger("blockchain-logger")
 
 
 # ---------------------------------------------------------------------------
-# Fabric: peer CLI transport
+# Fabric CLI path resolution
 # ---------------------------------------------------------------------------
-# We shell out to `peer chaincode invoke` instead of using any Python SDK.
-# fabric_sdk_py and fabric-gateway both depend on grpcio compiled wheels that
-# are not published for Python 3.14. The peer binary is already on PATH and
-# already verified by run.py Step 1.
-
+# All paths are derived from env vars already set by run.py.
+# We never hardcode directory trees -- that was the source of the previous
+# "MSP directory not found" error.
+#
+# Priority for each path:
+#   1. Dedicated env var (set by run.py)  -- always wins
+#   2. Path-derived fallback from a related var that IS set
+#
+# FABRIC_CFG_PATH  -- tells the peer binary where core.yaml lives.
+#   run.py sets this to fabric-samples/config (the standard location).
+#   crypto-config is NOT under fabric-samples/config; it is under REPO_ROOT.
 _FABRIC_CFG_PATH: str = os.environ.get(
     "FABRIC_CFG_PATH",
     str(Path(REPO_ROOT) / "fabric-samples" / "config"),
 )
 
-# Peer TLS CA -- used for --tlsRootCertFiles on invoke
-_PEER_TLS_CA: str = str(
-    Path(REPO_ROOT)
-    / "crypto-config"
-    / "peerOrganizations"
-    / "org1.example.com"
-    / "peers"
-    / "peer0.org1.example.com"
-    / "tls"
-    / "ca.crt"
-)
+# PEER TLS CA  -- used in --tlsRootCertFiles
+#   cfg.FABRIC_TLS_CERT is set by run.py to the peer's tls/ca.crt.
+#   This is exactly the file peer CLI needs for --tlsRootCertFiles.
+_PEER_TLS_CA: str = cfg.FABRIC_TLS_CERT   # e.g. .../peerOrgs/.../tls/ca.crt
 
-# Orderer TLS CA -- used for --cafile on invoke
-_ORDERER_TLS_CA: str = str(
-    Path(REPO_ROOT)
-    / "crypto-config"
-    / "ordererOrganizations"
-    / "example.com"
-    / "orderers"
-    / "orderer.example.com"
-    / "msp"
-    / "tlscacerts"
-    / "tlsca.example.com-cert.pem"
-)
+# ORDERER TLS CA  -- used in --cafile
+#   cfg.FABRIC_ORDERER_TLS_CERT is set by run.py when it runs lifecycle steps.
+#   Fallback: derive from PEER TLS CA by walking up to the crypto-config root
+#   and constructing the standard orderer path.
+def _resolve_orderer_tls_ca() -> str:
+    if cfg.FABRIC_ORDERER_TLS_CERT:
+        return cfg.FABRIC_ORDERER_TLS_CERT
+    # Fallback: FABRIC_TLS_CERT is something like:
+    #   <repo>/crypto-config/peerOrganizations/org1.example.com/peers/peer0.../tls/ca.crt
+    # Walk up 6 levels to reach crypto-config/, then build orderer path.
+    try:
+        p = Path(cfg.FABRIC_TLS_CERT)
+        # p.parents: [tls/, peer0.../, peers/, org1.../, peerOrganizations/, crypto-config/]
+        crypto_root = p.parents[5]
+        return str(
+            crypto_root
+            / "ordererOrganizations"
+            / "example.com"
+            / "orderers"
+            / "orderer.example.com"
+            / "msp"
+            / "tlscacerts"
+            / "tlsca.example.com-cert.pem"
+        )
+    except Exception:
+        # Last-resort: same directory as peer TLS CA, two orgs over
+        return str(Path(cfg.FABRIC_TLS_CERT).parent / "ca.crt")
 
+_ORDERER_TLS_CA: str = _resolve_orderer_tls_ca()
 
-def _admin_msp_path() -> str:
-    # FABRIC_SIGN_CERT is e.g. .../users/Admin@org1.example.com/msp/signcerts/cert.pem
-    # Walk up two levels to reach the msp/ directory.
+# ADMIN MSP PATH  -- used in CORE_PEER_MSPCONFIGPATH
+#   Must be the Admin USER msp directory, NOT the peer node msp.
+#   cfg.FABRIC_ADMIN_MSP_PATH is set by run.py for lifecycle steps.
+#   Fallback: FABRIC_SIGN_CERT is the admin's signing cert, so its
+#   grandparent directory is the msp/ folder we need.
+def _resolve_admin_msp() -> str:
+    if cfg.FABRIC_ADMIN_MSP_PATH:
+        return cfg.FABRIC_ADMIN_MSP_PATH
+    # FABRIC_SIGN_CERT e.g. .../users/Admin@org1.../msp/signcerts/cert.pem
+    # parent      = signcerts/
+    # parent.parent = msp/   <-- this is what peer CLI needs
     return str(Path(cfg.FABRIC_SIGN_CERT).parent.parent)
+
+_ADMIN_MSP_PATH: str = _resolve_admin_msp()
+
+
+def _log_fabric_paths() -> None:
+    """Emit resolved paths at startup so mismatches are immediately visible."""
+    log.info("Fabric CLI paths:")
+    log.info("  FABRIC_CFG_PATH       = %s  exists=%s", _FABRIC_CFG_PATH,
+             Path(_FABRIC_CFG_PATH).exists())
+    log.info("  PEER_TLS_CA           = %s  exists=%s", _PEER_TLS_CA,
+             Path(_PEER_TLS_CA).exists())
+    log.info("  ORDERER_TLS_CA        = %s  exists=%s", _ORDERER_TLS_CA,
+             Path(_ORDERER_TLS_CA).exists())
+    log.info("  ADMIN_MSP_PATH        = %s  exists=%s", _ADMIN_MSP_PATH,
+             Path(_ADMIN_MSP_PATH).exists())
+    log.info("  FABRIC_PEER_ENDPOINT  = %s", cfg.FABRIC_PEER_ENDPOINT)
+    log.info("  FABRIC_MSP_ID         = %s", cfg.FABRIC_MSP_ID)
+    log.info("  FABRIC_CHANNEL        = %s", cfg.FABRIC_CHANNEL)
+    log.info("  FABRIC_CHAINCODE      = %s", cfg.FABRIC_CHAINCODE)
 
 
 def _peer_env() -> dict:
@@ -111,7 +153,7 @@ def _peer_env() -> dict:
     env["CORE_PEER_TLS_ENABLED"]        = "true"
     env["CORE_PEER_LOCALMSPID"]         = cfg.FABRIC_MSP_ID
     env["CORE_PEER_ADDRESS"]            = cfg.FABRIC_PEER_ENDPOINT
-    env["CORE_PEER_MSPCONFIGPATH"]      = _admin_msp_path()
+    env["CORE_PEER_MSPCONFIGPATH"]      = _ADMIN_MSP_PATH
     env["CORE_PEER_TLS_ROOTCERT_FILE"]  = _PEER_TLS_CA
     return env
 
@@ -123,8 +165,8 @@ def _submit_to_fabric(event: SecurityEvent) -> str:
     Returns the tx-id string (parsed from peer output, or a sha256 fingerprint
     fallback). Raises RuntimeError on non-zero peer exit so the caller retries.
     """
-    payload_str  = json.dumps(event.to_ledger_dict(), default=str)
-    invoke_spec  = json.dumps({"Args": ["LogEvent", payload_str]})
+    payload_str = json.dumps(event.to_ledger_dict(), default=str)
+    invoke_spec = json.dumps({"Args": ["LogEvent", payload_str]})
 
     cmd = [
         "peer", "chaincode", "invoke",
@@ -154,14 +196,13 @@ def _submit_to_fabric(event: SecurityEvent) -> str:
     if result.returncode != 0:
         raise RuntimeError(
             f"peer chaincode invoke failed (rc={result.returncode}): "
-            f"{result.stderr.strip()[:400]}"
+            f"{result.stderr.strip()[:500]}"
         )
 
     # Parse real tx-id from peer output: "...txid [<txid>] committed..."
     tx_id = ""
     for line in combined.splitlines():
-        low = line.lower()
-        if "txid" in low and "[" in line:
+        if "txid" in line.lower() and "[" in line:
             try:
                 start = line.index("[") + 1
                 end   = line.index("]", start)
@@ -171,7 +212,6 @@ def _submit_to_fabric(event: SecurityEvent) -> str:
                 pass
 
     if not tx_id:
-        # Deterministic fallback: sha256 of the payload
         tx_id = "cli-" + hashlib.sha256(payload_str.encode()).hexdigest()[:32]
 
     log.debug("peer invoke stdout: %s", result.stdout.strip()[:200])
@@ -256,9 +296,8 @@ def _send_to_dlq(raw: bytes, reason: str) -> None:
 def process_message(raw: bytes) -> None:
     """
     Full pipeline for one Kafka message. Raises on unrecoverable error
-    so the caller can route to DLQ. Transient errors are retried.
+    so the caller routes to DLQ. Transient errors are retried by main().
     """
-    # Step 1 -- parse & validate schema
     try:
         event = SecurityEvent.from_kafka_bytes(raw)
     except Exception as exc:
@@ -267,41 +306,47 @@ def process_message(raw: bytes) -> None:
     log.info("Processing event_id=%s asset=%s severity=%s",
              event.event_id, event.asset_id, event.severity.value)
 
-    # Step 2 -- build canonical payload bytes
     payload_bytes = event.canonical_bytes()
 
-    # Step 3 -- add + pin to IPFS, get real CID
     cid, sha256_hex = add_and_pin(payload_bytes)
     event.ipfs_cid = cid
     event.sha256   = sha256_hex
 
-    # Step 4 -- verify IPFS round-trip before writing to chain
     if not fetch_and_verify(cid, sha256_hex):
         raise IPFSError(f"IPFS round-trip verify failed for CID {cid}")
 
-    # Step 5 -- sign canonical payload with agent key
     _load_agent_key()
     event.agent_identity  = _agent_identity
     event.agent_signature = _sign(payload_bytes)
 
-    # Step 6 -- submit to Fabric via peer CLI (blocks until committed)
     tx_id       = _submit_to_fabric(event)
     event.tx_id = tx_id
     log.info("Fabric commit OK  tx_id=%s  event_id=%s", tx_id, event.event_id)
 
-    # Step 7 -- write committed record to Redis (shared cache for audit-api)
     _write_to_redis(event)
-
-    # Step 8 -- offset committed by caller after this returns without error
 
 
 # -- Main consumer loop -------------------------------------------------------
 
 def main() -> None:
     log.info("blockchain-logger starting  config=%s", cfg.dump())
+    _log_fabric_paths()   # print resolved paths + exists checks before first invoke
 
     if not shutil.which("peer"):
         log.error("'peer' binary not found on PATH -- add fabric-samples/bin to PATH")
+        sys.exit(1)
+
+    # Abort early if any critical path is missing
+    missing = [
+        p for p in [_PEER_TLS_CA, _ORDERER_TLS_CA, _ADMIN_MSP_PATH]
+        if not Path(p).exists()
+    ]
+    if missing:
+        log.error("Critical Fabric paths do not exist on disk:")
+        for p in missing:
+            log.error("  MISSING: %s", p)
+        log.error("Check FABRIC_TLS_CERT, FABRIC_ORDERER_TLS_CERT, "
+                  "FABRIC_ADMIN_MSP_PATH, FABRIC_SIGN_CERT in your .env")
         sys.exit(1)
 
     consumer = Consumer(
@@ -352,10 +397,8 @@ def main() -> None:
                 succeeded = True
                 break
             except Exception as exc:
-                log.warning(
-                    "Transient error (attempt %d/%d): %s",
-                    attempt, max_retries, exc,
-                )
+                log.warning("Transient error (attempt %d/%d): %s",
+                            attempt, max_retries, exc)
                 traceback.print_exc()
                 if attempt < max_retries:
                     sleep_s = backoff_base * (2 ** (attempt - 1))
