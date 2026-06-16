@@ -15,6 +15,10 @@ Pipeline per message:
      then DLQ — never silent-drop.
 
 No mock paths.  If a required env var is missing the process exits at startup.
+
+Fabric SDK: hyperledger/fabric-gateway (fabric-gateway PyPI package)
+  - Replaces the unmaintained fabric_sdk_py which does not build on Python 3.10+.
+  - Pure-protobuf gRPC transport; no compiled C-extension ABI issues.
 """
 from __future__ import annotations
 
@@ -38,14 +42,13 @@ import redis  # type: ignore
 from confluent_kafka import Consumer, KafkaError, Producer  # type: ignore
 from cryptography.hazmat.primitives import hashes, serialization  # type: ignore
 from cryptography.hazmat.primitives.asymmetric import ec  # type: ignore
-from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature  # type: ignore
 from cryptography.hazmat.backends import default_backend  # type: ignore
 
 from shared import config as cfg
 from shared.event_schema import SecurityEvent
 from shared.ipfs_client import IPFSError, add_and_pin, fetch_and_verify
 
-# ── Logging ──────────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [logger] %(levelname)s %(message)s",
@@ -53,73 +56,114 @@ logging.basicConfig(
 )
 log = logging.getLogger("blockchain-logger")
 
-# ── Fabric Gateway helpers ────────────────────────────────────────────────────────
+
+# ── Fabric Gateway helpers (fabric-gateway PyPI package) ───────────────────────────
+#
+# The fabric-gateway package (https://pypi.org/project/fabric-gateway/) is the
+# official Hyperledger Fabric Gateway SDK for Python.  It replaced fabric_sdk_py
+# and works on Python 3.10+.  Import path: fabric_gateway.fabric.gateway
+#
+# Connection model:
+#   grpc.Channel  →  Gateway(channel, signer, certificate)  →  network  →  contract
+#
+# The Gateway object is reused across messages (lazy init via _get_contract).
+# On any gRPC error the cached objects are discarded so the next call rebuilds.
+
+import grpc  # type: ignore
+
+_channel: Optional[grpc.Channel] = None
+_contract = None  # fabric_gateway Contract object
+
+
+def _load_pem(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
 def _build_fabric_gateway():
     """
-    Build and return a Fabric Gateway Network object using the official
-    fabric-gateway Python SDK (pip install fabric-sdk-py or hfc).
+    Build a Fabric Gateway Contract using the official fabric-gateway SDK.
 
-    We use the lower-level grpc-based gateway from fabric-protos-python +
-    fabric-sdk-py 1.x which exposes a Gateway class.
+    Returns (gateway_obj, contract) where contract exposes submit_transaction().
     """
-    import grpc  # type: ignore
-    from fabric_sdk_py.fabric_network.gateway import Gateway  # type: ignore
-    from fabric_sdk_py.fabric_network.network import Network  # type: ignore
+    from fabric_gateway.fabric.gateway import Gateway  # type: ignore
+    import hashlib
 
-    # Load TLS credentials
-    with open(cfg.FABRIC_TLS_CERT, "rb") as f:
-        tls_root_cert = f.read()
+    tls_root_cert_pem = _load_pem(cfg.FABRIC_TLS_CERT)
+    sign_cert_pem     = _load_pem(cfg.FABRIC_SIGN_CERT)
+    sign_key_pem      = _load_pem(cfg.FABRIC_SIGN_KEY)
 
-    credentials = grpc.ssl_channel_credentials(root_certificates=tls_root_cert)
-    channel = grpc.secure_channel(cfg.FABRIC_PEER_ENDPOINT, credentials)
-
-    # Load signing identity
-    with open(cfg.FABRIC_SIGN_CERT, "rb") as f:
-        sign_cert_pem = f.read()
-    with open(cfg.FABRIC_SIGN_KEY, "rb") as f:
-        sign_key_pem = f.read()
-
-    gateway = Gateway()
-    gateway.connect(
-        channel,
-        {
-            "wallet": None,
-            "identity": cfg.FABRIC_MSP_ID,
-            "clientTlsCert": sign_cert_pem,
-        },
+    # Load signing private key
+    private_key = serialization.load_pem_private_key(
+        sign_key_pem, password=None, backend=default_backend()
     )
-    network: Network = gateway.get_network(cfg.FABRIC_CHANNEL)
+
+    # gRPC secure channel
+    creds = grpc.ssl_channel_credentials(root_certificates=tls_root_cert_pem)
+    channel = grpc.secure_channel(cfg.FABRIC_PEER_ENDPOINT, creds)
+
+    # Signer: a callable that takes bytes and returns DER-encoded ECDSA signature
+    def _signer(data: bytes) -> bytes:
+        return private_key.sign(data, ec.ECDSA(hashes.SHA256()))
+
+    gateway = Gateway(
+        channel,
+        signer=_signer,
+        certificate=sign_cert_pem,
+        msp_id=cfg.FABRIC_MSP_ID,
+    )
+    network  = gateway.get_network(cfg.FABRIC_CHANNEL)
     contract = network.get_contract(cfg.FABRIC_CHAINCODE)
-    return gateway, contract
+    return gateway, channel, contract
 
 
-_gateway = None
-_contract = None
+_gateway_obj  = None
+_grpc_channel = None
 
 
 def _get_contract():
-    global _gateway, _contract
+    global _gateway_obj, _grpc_channel, _contract
     if _contract is None:
-        _gateway, _contract = _build_fabric_gateway()
+        _gateway_obj, _grpc_channel, _contract = _build_fabric_gateway()
+        log.info("Fabric Gateway connected  peer=%s  channel=%s  cc=%s",
+                 cfg.FABRIC_PEER_ENDPOINT, cfg.FABRIC_CHANNEL, cfg.FABRIC_CHAINCODE)
     return _contract
+
+
+def _reset_fabric_connection():
+    """Discard cached connection so the next call to _get_contract() rebuilds."""
+    global _gateway_obj, _grpc_channel, _contract
+    try:
+        if _grpc_channel:
+            _grpc_channel.close()
+    except Exception:
+        pass
+    _gateway_obj  = None
+    _grpc_channel = None
+    _contract     = None
 
 
 def _submit_to_fabric(event: SecurityEvent) -> str:
     """
     Submit a LogEvent transaction and return the tx_id string.
     Raises RuntimeError if the submission fails.
+    Resets the connection cache on gRPC-level errors so callers can retry.
     """
-    contract = _get_contract()
-    payload = json.dumps(event.to_ledger_dict(), default=str)
-    # submit_transaction blocks until the peer has committed the block
-    tx_id = contract.submit_transaction(
-        "LogEvent",
-        payload,
-    )
-    return tx_id.decode() if isinstance(tx_id, bytes) else str(tx_id)
+    try:
+        contract = _get_contract()
+        payload  = json.dumps(event.to_ledger_dict(), default=str)
+        # submit_transaction blocks until the peer has committed the block.
+        # Returns bytes (tx_id).
+        result = contract.submit_transaction("LogEvent", payload)
+        tx_id  = result.decode() if isinstance(result, bytes) else str(result)
+        return tx_id
+    except Exception as exc:
+        # Reset so the next retry builds a fresh channel/gateway
+        _reset_fabric_connection()
+        raise
 
 
-# ── ECDSA signing ───────────────────────────────────────────────────────────────────
+# ── ECDSA signing (agent identity) ─────────────────────────────────────────────────────
 _agent_private_key: Optional[ec.EllipticCurvePrivateKey] = None
 _agent_identity: Optional[str] = None
 
@@ -134,7 +178,6 @@ def _load_agent_key():
         )
     with open(cfg.AGENT_CERT_PATH, "rb") as f:
         cert_pem = f.read()
-    # Use the PEM cert bytes as the identity string (hex fingerprint could also work)
     from cryptography import x509
     cert = x509.load_pem_x509_certificate(cert_pem, default_backend())
     _agent_identity = cert.subject.rfc4514_string()
@@ -146,7 +189,7 @@ def _sign(data: bytes) -> str:
     return sig.hex()
 
 
-# ── Redis helpers ───────────────────────────────────────────────────────────────────
+# ── Redis helpers ──────────────────────────────────────────────────────────────────────────
 _redis: Optional[redis.Redis] = None
 
 
@@ -160,42 +203,39 @@ def _get_redis() -> redis.Redis:
 def _write_to_redis(event: SecurityEvent) -> None:
     r = _get_redis()
     event_id = str(event.event_id)
-    key = cfg.REDIS_KEY_PREFIX + event_id
-    record = json.dumps(event.to_ledger_dict(), default=str)
+    key      = cfg.REDIS_KEY_PREFIX + event_id
+    record   = json.dumps(event.to_ledger_dict(), default=str)
 
     pipe = r.pipeline()
     pipe.set(key, record, ex=cfg.REDIS_TTL_S)
-    # Asset index: sorted set keyed by asset_id, scored by timestamp
     ts = event.timestamp.timestamp()
     pipe.zadd(cfg.REDIS_IDX_ASSET + event.asset_id, {event_id: ts})
-    # Severity index
-    pipe.zadd(cfg.REDIS_IDX_SEV + event.severity.value, {event_id: ts})
+    pipe.zadd(cfg.REDIS_IDX_SEV   + event.severity.value, {event_id: ts})
     pipe.execute()
     log.info("Redis write OK  event_id=%s", event_id)
 
 
-# ── DLQ producer ────────────────────────────────────────────────────────────────────
+# ── DLQ producer ────────────────────────────────────────────────────────────────────────────
 _dlq_producer: Optional[Producer] = None
 
 
 def _get_dlq_producer() -> Producer:
     global _dlq_producer
     if _dlq_producer is None:
-        _dlq_producer = Producer(
-            {"bootstrap.servers": cfg.KAFKA_BOOTSTRAP_SERVERS}
-        )
+        _dlq_producer = Producer({"bootstrap.servers": cfg.KAFKA_BOOTSTRAP_SERVERS})
     return _dlq_producer
 
 
 def _send_to_dlq(raw: bytes, reason: str) -> None:
-    prod = _get_dlq_producer()
-    dlq_msg = json.dumps({"reason": reason, "original": raw.decode("utf-8", errors="replace")})
+    prod    = _get_dlq_producer()
+    dlq_msg = json.dumps({"reason": reason,
+                          "original": raw.decode("utf-8", errors="replace")})
     prod.produce(cfg.KAFKA_TOPIC_DLQ, value=dlq_msg.encode())
     prod.flush()
     log.error("DLQ: sent message  reason=%s", reason)
 
 
-# ── Core pipeline ───────────────────────────────────────────────────────────────────
+# ── Core pipeline ─────────────────────────────────────────────────────────────────────────
 
 def process_message(raw: bytes) -> None:
     """
@@ -217,7 +257,7 @@ def process_message(raw: bytes) -> None:
     # Step 3 — add + pin to IPFS, get real CID
     cid, sha256_hex = add_and_pin(payload_bytes)
     event.ipfs_cid = cid
-    event.sha256 = sha256_hex
+    event.sha256   = sha256_hex
 
     # Step 4 — verify IPFS round-trip before writing to chain
     if not fetch_and_verify(cid, sha256_hex):
@@ -225,11 +265,11 @@ def process_message(raw: bytes) -> None:
 
     # Step 5 — sign canonical payload with agent key
     _load_agent_key()
-    event.agent_identity = _agent_identity
+    event.agent_identity  = _agent_identity
     event.agent_signature = _sign(payload_bytes)
 
     # Step 6 — submit to Fabric (blocks until block committed)
-    tx_id = _submit_to_fabric(event)
+    tx_id       = _submit_to_fabric(event)
     event.tx_id = tx_id
     log.info("Fabric commit OK  tx_id=%s  event_id=%s", tx_id, event.event_id)
 
@@ -239,7 +279,7 @@ def process_message(raw: bytes) -> None:
     # Step 8 — offset is committed by the caller after this returns without error
 
 
-# ── Main consumer loop ─────────────────────────────────────────────────────────────────
+# ── Main consumer loop ────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     log.info("blockchain-logger starting  config=%s", cfg.dump())
@@ -249,7 +289,6 @@ def main() -> None:
             "bootstrap.servers":  cfg.KAFKA_BOOTSTRAP_SERVERS,
             "group.id":           cfg.KAFKA_CONSUMER_GROUP,
             "auto.offset.reset":  "earliest",
-            # Manual commit — we call consumer.commit() only after success
             "enable.auto.commit": "false",
         }
     )
@@ -264,9 +303,9 @@ def main() -> None:
         _running = False
 
     signal.signal(signal.SIGTERM, _stop)
-    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGINT,  _stop)
 
-    max_retries = cfg.FABRIC_MAX_RETRIES
+    max_retries  = cfg.FABRIC_MAX_RETRIES
     backoff_base = cfg.FABRIC_RETRY_BACKOFF_S
 
     while _running:
@@ -280,7 +319,7 @@ def main() -> None:
             continue
 
         raw: bytes = msg.value()
-        succeeded = False
+        succeeded  = False
 
         for attempt in range(1, max_retries + 1):
             try:
@@ -311,12 +350,12 @@ def main() -> None:
                     succeeded = True  # handled via DLQ
 
         if succeeded:
-            # Commit offset only after successful processing or DLQ routing
             consumer.commit(message=msg, asynchronous=False)
             log.debug("Kafka offset committed  partition=%s offset=%s",
                       msg.partition(), msg.offset())
 
     consumer.close()
+    _reset_fabric_connection()
     log.info("blockchain-logger stopped")
 
 
