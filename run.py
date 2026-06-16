@@ -118,9 +118,6 @@ def _detect_fabric_bin_dir() -> str:
     if existing and Path(existing, "peer").exists():
         return existing
     candidates: list[Path] = []
-    cfg_path_str = os.environ.get("FABRIC_CFG_PATH", "").strip()
-    if cfg_path_str:
-        candidates.append(Path(cfg_path_str).parent / "bin")
     repo_root = Path(__file__).parent.resolve()
     candidates.append(repo_root / "fabric-samples" / "bin")
     for c in candidates:
@@ -192,22 +189,39 @@ def inject_etc_hosts():
 
 
 # ============================================================
-# FABRIC_CFG_PATH auto-detection
+# FABRIC_CFG_PATH resolution
 # ============================================================
 
 def find_fabric_cfg_path() -> str:
-    candidates = [
-        Path(__file__).parent / "fabric-samples" / "config",
-        Path.home() / "fabric-samples" / "config",
-        Path.home() / "go" / "src" / "github.com" / "hyperledger" / "fabric-samples" / "config",
-    ]
+    """
+    Resolve FABRIC_CFG_PATH in priority order:
+      1. FABRIC_CFG_PATH already set in environment (from project.env or shell)
+         — accepted immediately even if core.yaml is absent (configtxgen uses
+           -configPath so it doesn't need core.yaml at genesis-gen time)
+      2. fabric-samples/config (has core.yaml — needed by peer commands)
+      3. Fallback: write a minimal core.yaml into ./fabric-config/
+
+    NOTE: configtxgen calls in generate_crypto_and_genesis() ALWAYS pass
+    -configPath pointing at the repo root so they read OUR configtx.yaml
+    regardless of FABRIC_CFG_PATH.  FABRIC_CFG_PATH is only needed by 'peer'.
+    """
+    repo_root = Path(__file__).parent.resolve()
+
+    # 1. Respect explicit env var set by project.env / shell
     env_cfg = os.environ.get("FABRIC_CFG_PATH", "").strip()
     if env_cfg:
-        candidates.append(Path(env_cfg))
-    for c in candidates:
-        if c and (c / "core.yaml").exists():
-            return str(c)
-    cfg_dir   = Path(__file__).parent / "fabric-config"
+        p = Path(env_cfg)
+        os.environ["FABRIC_CFG_PATH"] = str(p)
+        return str(p)
+
+    # 2. fabric-samples/config (has core.yaml — safe for peer commands)
+    fs_config = repo_root / "fabric-samples" / "config"
+    if (fs_config / "core.yaml").exists():
+        os.environ["FABRIC_CFG_PATH"] = str(fs_config)
+        return str(fs_config)
+
+    # 3. Minimal fallback
+    cfg_dir   = repo_root / "fabric-config"
     cfg_dir.mkdir(exist_ok=True)
     core_yaml = cfg_dir / "core.yaml"
     if not core_yaml.exists():
@@ -257,6 +271,7 @@ operations:
 metrics:
   provider: disabled
 """)
+    os.environ["FABRIC_CFG_PATH"] = str(cfg_dir)
     return str(cfg_dir)
 
 
@@ -542,7 +557,7 @@ def _generate_agent_keypair():
     ))
     cert_path.parent.mkdir(parents=True, exist_ok=True)
     cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-    ok(f"Agent keypair written → {key_path}  /  {cert_path}")
+    ok(f"Agent keypair written \u2192 {key_path}  /  {cert_path}")
 
 
 # ============================================================
@@ -551,6 +566,10 @@ def _generate_agent_keypair():
 
 def generate_crypto_and_genesis():
     hdr("Step 2 — Generate Crypto Material & Genesis Block")
+
+    # repo root always has our configtx.yaml — pass it explicitly to configtxgen
+    repo_root = str(Path(__file__).parent.resolve())
+
     crypto_cfg = Path("crypto-config.yaml")
     if not crypto_cfg.exists():
         crypto_cfg.write_text("""\
@@ -569,33 +588,46 @@ PeerOrgs:
       Count: 1
 """)
         info("Written crypto-config.yaml")
+
     Path("channel-artifacts").mkdir(exist_ok=True)
+
     if not Path("crypto-config").exists():
         info("Running cryptogen ...")
         subprocess.check_call(["cryptogen", "generate", "--config=./crypto-config.yaml"])
         ok("crypto-config/ generated")
     else:
         ok("crypto-config/ already exists — skipping")
+
     genesis = Path("channel-artifacts/genesis.block")
     if not genesis.exists():
         info("Running configtxgen (genesis block) ...")
+        # -configPath forces configtxgen to read OUR configtx.yaml (repo root)
+        # regardless of what FABRIC_CFG_PATH points to
         subprocess.check_call([
-            "configtxgen", "-profile", "TwoOrgsOrdererGenesis",
-            "-channelID", "system-channel", "-outputBlock", str(genesis),
+            "configtxgen",
+            "-configPath", repo_root,
+            "-profile", "TwoOrgsOrdererGenesis",
+            "-channelID", "system-channel",
+            "-outputBlock", str(genesis),
         ])
         ok("genesis.block created")
     else:
         ok("genesis.block already exists — skipping")
+
     ch_tx = Path("channel-artifacts/security-channel.tx")
     if not ch_tx.exists():
         info("Running configtxgen (channel tx) ...")
         subprocess.check_call([
-            "configtxgen", "-profile", "TwoOrgsChannel",
-            "-outputCreateChannelTx", str(ch_tx), "-channelID", "security-channel",
+            "configtxgen",
+            "-configPath", repo_root,
+            "-profile", "TwoOrgsChannel",
+            "-outputCreateChannelTx", str(ch_tx),
+            "-channelID", "security-channel",
         ])
         ok("security-channel.tx created")
     else:
         ok("security-channel.tx already exists — skipping")
+
     _generate_agent_keypair()
 
 
