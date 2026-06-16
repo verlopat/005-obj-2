@@ -28,6 +28,42 @@ import socket
 from datetime import datetime, timezone
 from pathlib import Path
 
+# ============================================================
+# Load .env file FIRST — before any os.environ reads
+# ============================================================
+def _load_dotenv():
+    """
+    Load variables from .env into os.environ.
+    Uses python-dotenv if available; falls back to a simple parser.
+    Never overwrites variables already set in the shell environment.
+    """
+    env_file = Path(__file__).parent / ".env"
+    if not env_file.exists():
+        return
+
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(dotenv_path=env_file, override=False)
+        return
+    except ImportError:
+        pass
+
+    # Fallback: minimal .env parser (no dotenv installed yet)
+    with open(env_file) as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip('"\'')
+            if key and key not in os.environ:
+                os.environ[key] = val
+
+_load_dotenv()
+
+# ============================================================
+
 GREEN  = "\033[92m"
 YELLOW = "\033[93m"
 RED    = "\033[91m"
@@ -88,31 +124,16 @@ SAMPLE_EVENTS = [
 # ============================================================
 
 def _detect_fabric_bin_dir() -> str:
-    """
-    Detect the directory containing the Fabric CLI binaries (peer, orderer, …).
-
-    Resolution order:
-      1. FABRIC_BIN_DIR env var  (already set by operator or previous call)
-      2. fabric-samples/bin/ next to FABRIC_CFG_PATH
-         (FABRIC_CFG_PATH = .../fabric-samples/config  → bin is its sibling)
-      3. <repo>/fabric-samples/bin/
-      4. shutil.which("peer") fallback — use its parent directory
-
-    Returns the directory path as a string, or "" if nothing found.
-    """
-    # 1. Already set
     existing = os.environ.get("FABRIC_BIN_DIR", "").strip()
     if existing and Path(existing, "peer").exists():
         return existing
 
     candidates: list[Path] = []
 
-    # 2. Sibling of FABRIC_CFG_PATH
     cfg_path_str = os.environ.get("FABRIC_CFG_PATH", "").strip()
     if cfg_path_str:
         candidates.append(Path(cfg_path_str).parent / "bin")
 
-    # 3. Repo-relative
     repo_root = Path(__file__).parent.resolve()
     candidates.append(repo_root / "fabric-samples" / "bin")
 
@@ -120,7 +141,6 @@ def _detect_fabric_bin_dir() -> str:
         if (c / "peer").exists():
             return str(c)
 
-    # 4. PATH fallback
     which = shutil.which("peer")
     if which:
         return str(Path(which).parent)
@@ -129,22 +149,14 @@ def _detect_fabric_bin_dir() -> str:
 
 
 def inject_fabric_bin_into_path() -> str:
-    """
-    Inject the Fabric bin directory into os.environ["PATH"] and
-    os.environ["FABRIC_BIN_DIR"] so all child processes inherit it.
-
-    Returns the resolved bin dir (or "" if not found).
-    """
     bin_dir = _detect_fabric_bin_dir()
     if not bin_dir:
         warn("Could not detect fabric-samples/bin directory — "
              "set FABRIC_BIN_DIR=/path/to/fabric-samples/bin in .env if peer is missing")
         return ""
 
-    # Set the dedicated env var (picked up by blockchain-logger's _resolve_peer_bin)
     os.environ["FABRIC_BIN_DIR"] = bin_dir
 
-    # Also prepend to PATH so shutil.which() and any bare "peer" calls work
     current_path = os.environ.get("PATH", "")
     path_parts = current_path.split(os.pathsep)
     if bin_dir not in path_parts:
@@ -168,10 +180,6 @@ def _venv_python_path() -> Path:
     return VENV_DIR / "bin" / "python3"
 
 
-# NOTE: _venv_pip_path() was removed — all pip calls use "python -m pip" instead
-# (the pip binary symlink is not guaranteed to exist on all Python versions).
-
-
 def _make_venv():
     if VENV_DIR.exists():
         shutil.rmtree(str(VENV_DIR))
@@ -192,10 +200,6 @@ def ensure_venv():
             f"Run manually:  rm -rf {VENV_DIR} && python3 -m venv {VENV_DIR}"
         )
 
-    # Use "python -m pip" instead of the pip3/pip binary — the binary symlink
-    # is not guaranteed to exist in all Python versions (e.g. Python 3.14 on
-    # Arch Linux only creates "pip", not "pip3", and only after ensurepip runs).
-    # "python -m pip" always works as long as pip is installed in the venv.
     subprocess.call([str(venv_python), "-m", "pip", "install", "--upgrade", "pip", "-q"])
 
     for req in sorted(Path("services").rglob("requirements.txt")):
@@ -209,7 +213,6 @@ def ensure_venv():
             warn(f"  {req} \u2014 some packages failed (check manually)")
 
     ok(f"Using venv python: {venv_python}")
-    # Return venv_python twice for API compat (callers unpack as venv_python, _)
     return str(venv_python), str(venv_python)
 
 
@@ -272,9 +275,6 @@ def find_fabric_cfg_path() -> str:
         Path.home() / "go" / "src" / "github.com" / "hyperledger" / "fabric-samples" / "config",
     ]
 
-    # Only add the env var candidate when FABRIC_CFG_PATH is actually set.
-    # An empty string would resolve to Path("") == cwd and could give a false
-    # positive if core.yaml happens to exist there for an unrelated reason.
     env_cfg = os.environ.get("FABRIC_CFG_PATH", "").strip()
     if env_cfg:
         candidates.append(Path(env_cfg))
@@ -361,7 +361,6 @@ def _find_orderer_tls_ca() -> str:
 # ============================================================
 
 def _wait_for_peer_port(host: str, port: int, timeout: int = 60) -> bool:
-    """Poll TCP host:port until it accepts connections or timeout expires."""
     info(f"Waiting for {host}:{port} to accept connections (up to {timeout}s) ...")
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -379,7 +378,6 @@ def _wait_for_peer_port(host: str, port: int, timeout: int = 60) -> bool:
 # ============================================================
 
 def _get_compose_project_name() -> str:
-    """Return the Docker Compose project name (directory name by default)."""
     result = subprocess.run(
         ["docker", "compose", "config", "--format", "json"],
         capture_output=True, text=True,
@@ -392,29 +390,14 @@ def _get_compose_project_name() -> str:
                 return name
         except Exception:
             pass
-    # Fallback: use the current directory name (lowercased, hyphens)
     return Path(".").resolve().name.lower().replace("_", "-")
 
 
 def _reset_peer_ledger(peer_service: str = "peer0.org1.example.com"):
-    """
-    Remove the peer container and its ledger volume so that the peer starts
-    fresh on the next `docker compose up`.  This is required whenever the
-    orderer is recreated (volumes wiped) because the peer's on-disk block 0
-    hash will no longer match the new orderer's genesis block.
-
-    Steps:
-      1. docker compose rm -sf <peer_service>   — stop + remove container
-      2. docker volume rm <project>_peer0data   — drop ledger volume (best-effort)
-      3. docker compose up -d <peer_service>    — recreate with empty ledger
-    """
     warn(f"Resetting peer ledger for {peer_service} to clear stale block hashes ...")
 
-    # 1. Stop and remove the peer container
     subprocess.call(["docker", "compose", "rm", "-sf", peer_service])
 
-    # 2. Remove the named volume that holds /var/hyperledger/production
-    #    Try common volume-name patterns used in the compose file.
     project = _get_compose_project_name()
     volume_candidates = [
         f"{project}_peer0data",
@@ -431,7 +414,6 @@ def _reset_peer_ledger(peer_service: str = "peer0.org1.example.com"):
             ok(f"Removed Docker volume: {vol}")
             break
     else:
-        # Fallback: inspect running volumes and find ones whose name contains "peer0"
         r2 = subprocess.run(
             ["docker", "volume", "ls", "--format", "{{.Name}}"],
             capture_output=True, text=True,
@@ -445,7 +427,6 @@ def _reset_peer_ledger(peer_service: str = "peer0.org1.example.com"):
                 )
                 ok(f"Removed Docker volume: {vname}")
 
-    # 3. Recreate just the peer container
     info(f"Recreating {peer_service} container with empty ledger ...")
     subprocess.check_call(["docker", "compose", "up", "-d", peer_service])
     info("Waiting 10 s for peer to initialise ...")
@@ -467,8 +448,6 @@ def _channel_exists(channel: str, env: dict) -> bool:
 
 def _channel_exists_on_orderer(channel: str, orderer_addr: str,
                                 orderer_tls: str, env: dict) -> bool:
-    """Ask the orderer directly whether it knows about this channel.
-    Uses osnadmin if available, falls back to a peer channel fetch probe."""
     if shutil.which("osnadmin"):
         orderer_admin_addr = orderer_addr.replace("7050", "7053")
         orderer_tls_dir = Path(orderer_tls).parent.parent
@@ -489,7 +468,6 @@ def _channel_exists_on_orderer(channel: str, orderer_addr: str,
             except Exception:
                 return channel in r.stdout
 
-    # Fallback: fetch block 0; NOT_FOUND => channel absent on orderer
     r = _peer_run([
         "peer", "channel", "fetch", "0",
         "/dev/null",
@@ -506,8 +484,6 @@ def _channel_exists_on_orderer(channel: str, orderer_addr: str,
 
 def _peer_ledger_synced(channel: str, orderer_addr: str, orderer_tls: str,
                         env: dict, timeout: int = 60) -> bool:
-    """Poll until peer deliver stream is ready for the channel (no EOF/UNAVAILABLE).
-    Returns True when peer channel getinfo succeeds, False on timeout."""
     info(f"Waiting for peer ledger to sync on {channel} (up to {timeout}s) ...")
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -519,7 +495,6 @@ def _peer_ledger_synced(channel: str, orderer_addr: str, orderer_tls: str,
         if "eof" in combined or "unavailable" in combined or "not found" in combined:
             time.sleep(3)
             continue
-        # Any other non-zero is a config error, not a timing issue
         if r.returncode != 0:
             warn(f"getinfo returned: {r.stderr.strip()[:120]}")
             time.sleep(3)
@@ -537,7 +512,6 @@ def _chaincode_installed(name: str, peer_addr: str, tls_cert: str, env: dict) ->
 
 def _orderer_reachable(orderer_addr: str, orderer_tls: str,
                        channel: str, env: dict) -> bool:
-    """Return True only if the orderer responds for this channel."""
     r = _peer_run([
         "peer", "lifecycle", "chaincode", "checkcommitreadiness",
         "--channelID", channel,
@@ -585,7 +559,7 @@ def _chaincode_committed(channel: str, name: str, env: dict) -> bool:
 
 
 # ============================================================
-# 1. PREREQUISITE CHECKS  (live only — no mock fallback)
+# 1. PREREQUISITE CHECKS
 # ============================================================
 
 def check_prereqs() -> bool:
@@ -608,6 +582,9 @@ def check_prereqs() -> bool:
     chk("Docker",         ["docker", "--version"])
     chk("Docker Compose", ["docker", "compose", "version"])
     chk("Go",             ["go", "version"])
+
+    # Inject Fabric bin dir into PATH before checking for binaries
+    inject_fabric_bin_into_path()
 
     for bin_ in ["cryptogen", "configtxgen", "peer"]:
         if shutil.which(bin_):
@@ -633,7 +610,7 @@ def check_prereqs() -> bool:
         if val:
             ok(f"env {var}: [set]")
         else:
-            err(f"env {var}: MISSING \u2014 export it or add to .env before running")
+            err(f"env {var}: MISSING \u2014 add it to .env then re-run")
             all_ok = False
 
     return all_ok
@@ -644,15 +621,6 @@ def check_prereqs() -> bool:
 # ============================================================
 
 def _generate_agent_keypair():
-    """
-    Generate a P-256 ECDSA keypair for the blockchain-logger agent identity.
-
-    Writes:
-      crypto-config/agent/keystore/agent_sk    — PEM private key (PKCS8)
-      crypto-config/agent/signcerts/agent.pem  — PEM self-signed X.509 cert
-
-    Skips silently if both files already exist.
-    """
     key_path  = Path("crypto-config/agent/keystore/agent_sk")
     cert_path = Path("crypto-config/agent/signcerts/agent.pem")
 
@@ -668,8 +636,6 @@ def _generate_agent_keypair():
         from cryptography import x509
         from cryptography.x509.oid import NameOID
     except ImportError:
-        # cryptography may not be installed in the system Python yet;
-        # install it quietly and retry.
         subprocess.check_call(
             [sys.executable, "-m", "pip", "install", "cryptography", "-q"]
         )
@@ -678,10 +644,8 @@ def _generate_agent_keypair():
         from cryptography import x509
         from cryptography.x509.oid import NameOID
 
-    # Generate private key
     private_key = ec.generate_private_key(ec.SECP256R1())
 
-    # Build a minimal self-signed certificate (valid 10 years)
     subject = issuer = x509.Name([
         x509.NameAttribute(NameOID.COMMON_NAME, "audit-agent"),
         x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Org1MSP"),
@@ -699,7 +663,6 @@ def _generate_agent_keypair():
         .sign(private_key, hashes.SHA256())
     )
 
-    # Write key
     key_path.parent.mkdir(parents=True, exist_ok=True)
     key_path.write_bytes(
         private_key.private_bytes(
@@ -709,7 +672,6 @@ def _generate_agent_keypair():
         )
     )
 
-    # Write cert
     cert_path.parent.mkdir(parents=True, exist_ok=True)
     cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
 
@@ -773,7 +735,6 @@ PeerOrgs:
     else:
         ok("security-channel.tx already exists \u2014 skipping")
 
-    # Generate the agent keypair used by blockchain-logger for ECDSA signing
     _generate_agent_keypair()
 
 
@@ -791,8 +752,6 @@ def start_docker_stack():
     result = subprocess.check_output(
         ["docker", "compose", "ps", "--format", "json"], text=True
     ).strip()
-    # docker compose ps --format json outputs one JSON object per line (JSONL),
-    # NOT a JSON array.  Parse each line individually.
     try:
         services = [json.loads(line) for line in result.splitlines() if line.strip()]
     except Exception:
@@ -811,7 +770,7 @@ def teardown_docker_stack():
 
 
 # ============================================================
-# 4. CHANNEL + CHAINCODE SETUP  (fully idempotent with explicit state checks)
+# 4. CHANNEL + CHAINCODE SETUP
 # ============================================================
 
 def setup_channel_and_chaincode():
@@ -850,7 +809,6 @@ def setup_channel_and_chaincode():
         "CORE_PEER_TLS_ROOTCERT_FILE": peer_tls_ca,
     }
 
-    # ── 1. Orderer-aware channel create ────────────────────────────────────────
     block = Path(f"channel-artifacts/{CHANNEL}.block")
     force_rejoin = False
 
@@ -1005,7 +963,7 @@ def setup_channel_and_chaincode():
 
 
 # ============================================================
-# 5. START PYTHON SERVICES  (fail fast if any service doesn't start)
+# 5. START PYTHON SERVICES
 # ============================================================
 
 def wait_for_port(port: int, timeout: int = 60) -> bool:
@@ -1021,38 +979,24 @@ def wait_for_port(port: int, timeout: int = 60) -> bool:
 
 def _wait_for_log_line(log_path: Path, marker: str, proc,
                        timeout: int = 60) -> bool:
-    """
-    Poll log_path until `marker` appears in the file content OR the process
-    has exited (indicating a startup crash).  Returns True on success.
-    """
     deadline = time.time() + timeout
     while time.time() < deadline:
-        # Process crashed — stop waiting immediately
         if proc.poll() is not None:
             return False
         if log_path.exists():
             content = log_path.read_text(errors="replace")
             if marker in content:
                 return True
-            # Also treat ERROR lines after startup as a hard failure
             lines = content.splitlines()
             for line in lines[-5:]:
                 if "ERROR" in line and "Retrying" not in line and "DLQ" not in line:
-                    # Non-retry error at startup — treat as crash
                     return False
         time.sleep(0.5)
     return False
 
 
-# Services table:
-#   (name, script, health_check)
-# health_check is either:
-#   int  — TCP port to probe (service is an HTTP server)
-#   str  — log-line marker to wait for (service is a background worker)
 _SERVICES = [
     ("detector-adapter",  "services/detector-adapter/app.py",  8000),
-    # blockchain-logger is a pure Kafka consumer — no HTTP port.
-    # We verify it started by waiting for the 'Subscribed to topic' log line.
     ("blockchain-logger", "services/blockchain-logger/app.py",  "Subscribed to topic"),
     ("audit-api",         "services/audit-api/app.py",          8001),
 ]
@@ -1062,16 +1006,10 @@ def start_services():
     hdr("Step 5 \u2014 Start Python Microservices")
     venv_python, _ = ensure_venv()
 
-    # Inject the Fabric bin directory into the current process environment
-    # BEFORE spawning child processes.  Popen inherits os.environ, so all
-    # services (including blockchain-logger) will have FABRIC_BIN_DIR set
-    # and the bin dir prepended to PATH.
     fabric_bin = inject_fabric_bin_into_path()
     if fabric_bin:
         ok(f"FABRIC_BIN_DIR injected for child processes: {fabric_bin}")
 
-    # Inject BLOCKCHAIN_LOGGER_REPO_ROOT so blockchain-logger/app.py can
-    # anchor all relative cert/key paths correctly regardless of cwd.
     repo_root = str(Path(__file__).parent.resolve())
     os.environ["BLOCKCHAIN_LOGGER_REPO_ROOT"] = repo_root
     info(f"BLOCKCHAIN_LOGGER_REPO_ROOT set to: {repo_root}")
@@ -1086,9 +1024,6 @@ def start_services():
         log_path.parent.mkdir(exist_ok=True)
         log_fh   = open(log_path, "w")
         svc_dir  = str(script_path.parent.resolve())
-        # Pass the current os.environ (which now includes FABRIC_BIN_DIR,
-        # BLOCKCHAIN_LOGGER_REPO_ROOT, and the updated PATH) explicitly so
-        # the child inherits everything.
         p = subprocess.Popen(
             [venv_python, "app.py"],
             cwd=svc_dir,
@@ -1107,7 +1042,6 @@ def start_services():
             ready = wait_for_port(health, timeout=60)
             label = f":{health}"
         else:
-            # Log-line probe for background workers (no HTTP port)
             ready = _wait_for_log_line(log_path, health, p, timeout=60)
             label = f"log marker '{health}'"
 
@@ -1131,7 +1065,7 @@ def start_services():
 
 
 # ============================================================
-# 6. LIVE DEMO + BENCHMARK  (real Fabric/IPFS/Kafka paths only)
+# 6. LIVE DEMO + BENCHMARK
 # ============================================================
 
 def run_live_demo_and_benchmark() -> dict:
@@ -1151,10 +1085,6 @@ def run_live_demo_and_benchmark() -> dict:
             err(f"  {ev['asset_id']}: ingest failed: {e}")
             sys.exit(1)
 
-    # 8 events × ~4 s each (IPFS pin + Fabric endorse + commit + Redis write).
-    # 15 s covers sequential commit of all events with a small safety margin.
-    # If the blockchain-logger log shows all 8 "Fabric commit OK" lines before
-    # the 15 s elapses the Step 7 query will simply find data immediately.
     info("Waiting 15 s for blockchain-logger to commit all events ...")
     time.sleep(15)
 
@@ -1323,7 +1253,6 @@ def main():
         teardown_docker_stack()
         return
 
-    # Live path: check all prereqs and required env vars first
     prereqs_ok = check_prereqs()
     if not prereqs_ok:
         err("Prerequisites or required env vars missing. Fix above errors then re-run.")
@@ -1334,9 +1263,9 @@ def main():
         start_docker_stack()
         setup_channel_and_chaincode()
 
-    procs = start_services()  # exits with code 1 if any service fails
+    procs = start_services()
 
-    results = run_live_demo_and_benchmark()  # exits with code 1 on any failure
+    results = run_live_demo_and_benchmark()
     print_and_save_results(results)
 
     info("All live checks passed. Leaving services running. Press Ctrl+C to stop.")
