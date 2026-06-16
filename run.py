@@ -29,33 +29,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # ============================================================
-# Load project.env file FIRST — before any os.environ reads
-# NOTE: env vars file is named "project.env" (not ".env") because
-#       ".env" is the Python virtual environment directory.
+# Load project.env FIRST — before any os.environ reads
 # ============================================================
 def _load_dotenv():
-    """
-    Load variables from project.env into os.environ.
-    Uses python-dotenv if available; falls back to a simple parser.
-    Never overwrites variables already set in the shell environment.
-    """
     env_file = Path(__file__).parent / "project.env"
     if not env_file.exists():
-        # legacy fallback: if somehow a .env FILE exists (not directory)
-        legacy = Path(__file__).parent / ".env"
-        if legacy.is_file():
-            env_file = legacy
-        else:
-            return
-
+        return
     try:
         from dotenv import load_dotenv
         load_dotenv(dotenv_path=env_file, override=False)
         return
     except ImportError:
         pass
-
-    # Fallback: minimal parser (no dotenv installed yet)
     with open(env_file) as fh:
         for raw in fh:
             line = raw.strip()
@@ -88,8 +73,6 @@ def hdr(msg):  print(f"\n{BOLD}{CYAN}{SEP}\n  {msg}\n{SEP}{RESET}")
 
 RESULTS_FILE = Path("results/run_results.json")
 RESULTS_FILE.parent.mkdir(exist_ok=True)
-
-VENV_DIR = Path(__file__).parent.resolve() / ".venv"
 
 FABRIC_HOSTS = [
     "peer0.org1.example.com",
@@ -134,36 +117,27 @@ def _detect_fabric_bin_dir() -> str:
     existing = os.environ.get("FABRIC_BIN_DIR", "").strip()
     if existing and Path(existing, "peer").exists():
         return existing
-
     candidates: list[Path] = []
-
     cfg_path_str = os.environ.get("FABRIC_CFG_PATH", "").strip()
     if cfg_path_str:
         candidates.append(Path(cfg_path_str).parent / "bin")
-
     repo_root = Path(__file__).parent.resolve()
     candidates.append(repo_root / "fabric-samples" / "bin")
-
     for c in candidates:
         if (c / "peer").exists():
             return str(c)
-
     which = shutil.which("peer")
     if which:
         return str(Path(which).parent)
-
     return ""
 
 
 def inject_fabric_bin_into_path() -> str:
     bin_dir = _detect_fabric_bin_dir()
     if not bin_dir:
-        warn("Could not detect fabric-samples/bin directory — "
-             "set FABRIC_BIN_DIR=/path/to/fabric-samples/bin in project.env if peer is missing")
+        warn("Could not detect fabric-samples/bin — set FABRIC_BIN_DIR in project.env")
         return ""
-
     os.environ["FABRIC_BIN_DIR"] = bin_dir
-
     current_path = os.environ.get("PATH", "")
     path_parts = current_path.split(os.pathsep)
     if bin_dir not in path_parts:
@@ -171,56 +145,7 @@ def inject_fabric_bin_into_path() -> str:
         info(f"Prepended fabric bin dir to PATH: {bin_dir}")
     else:
         ok(f"Fabric bin dir already on PATH: {bin_dir}")
-
     return bin_dir
-
-
-# ============================================================
-def _venv_python_path() -> Path:
-    for name in ("python3", "python"):
-        candidate = VENV_DIR / "bin" / name
-        if candidate.exists():
-            return candidate
-    win = VENV_DIR / "Scripts" / "python.exe"
-    if win.exists():
-        return win
-    return VENV_DIR / "bin" / "python3"
-
-
-def _make_venv():
-    if VENV_DIR.exists():
-        shutil.rmtree(str(VENV_DIR))
-    info(f"Creating venv at {VENV_DIR} ...")
-    subprocess.check_call([sys.executable, "-m", "venv", str(VENV_DIR)])
-    ok(".venv created")
-
-
-def ensure_venv():
-    if not _venv_python_path().exists():
-        _make_venv()
-
-    venv_python = _venv_python_path()
-
-    if not venv_python.exists():
-        raise RuntimeError(
-            f"venv python not found at {venv_python} even after recreation.\n"
-            f"Run manually:  rm -rf {VENV_DIR} && python3 -m venv {VENV_DIR}"
-        )
-
-    subprocess.call([str(venv_python), "-m", "pip", "install", "--upgrade", "pip", "-q"])
-
-    for req in sorted(Path("services").rglob("requirements.txt")):
-        info(f"Installing {req} into .venv ...")
-        result = subprocess.call(
-            [str(venv_python), "-m", "pip", "install", "-r", str(req), "-q"]
-        )
-        if result == 0:
-            ok(f"  {req} \u2014 done")
-        else:
-            warn(f"  {req} \u2014 some packages failed (check manually)")
-
-    ok(f"Using venv python: {venv_python}")
-    return str(venv_python), str(venv_python)
 
 
 # ============================================================
@@ -238,15 +163,12 @@ def _hosts_already_patched() -> bool:
 def inject_etc_hosts():
     if platform.system() != "Linux":
         return
-
     if _hosts_already_patched():
         ok("Fabric hostnames already in /etc/hosts")
         return
-
     entries = "\n# Hyperledger Fabric local dev (added by run.py)\n"
     for h in FABRIC_HOSTS:
         entries += f"127.0.0.1  {h}\n"
-
     try:
         result = subprocess.run(
             ["sudo", "tee", "-a", "/etc/hosts"],
@@ -257,7 +179,6 @@ def inject_etc_hosts():
             return
     except FileNotFoundError:
         pass
-
     try:
         with open("/etc/hosts", "a") as fh:
             fh.write(entries)
@@ -265,7 +186,6 @@ def inject_etc_hosts():
         return
     except PermissionError:
         pass
-
     warn("Could not inject /etc/hosts (no sudo / not root).")
     warn("Run manually ONCE:")
     warn("  sudo bash -c 'echo \"127.0.0.1  peer0.org1.example.com orderer.example.com\" >> /etc/hosts'")
@@ -281,15 +201,12 @@ def find_fabric_cfg_path() -> str:
         Path.home() / "fabric-samples" / "config",
         Path.home() / "go" / "src" / "github.com" / "hyperledger" / "fabric-samples" / "config",
     ]
-
     env_cfg = os.environ.get("FABRIC_CFG_PATH", "").strip()
     if env_cfg:
         candidates.append(Path(env_cfg))
-
     for c in candidates:
         if c and (c / "core.yaml").exists():
             return str(c)
-
     cfg_dir   = Path(__file__).parent / "fabric-config"
     cfg_dir.mkdir(exist_ok=True)
     core_yaml = cfg_dir / "core.yaml"
@@ -344,7 +261,7 @@ metrics:
 
 
 # ============================================================
-# helpers — orderer TLS CA path probe
+# helpers
 # ============================================================
 
 def _find_orderer_tls_ca() -> str:
@@ -357,15 +274,9 @@ def _find_orderer_tls_ca() -> str:
     for c in candidates:
         if c.exists():
             return str(c.resolve())
-    warn("Orderer TLS CA cert not found in any expected location:")
-    for c in candidates:
-        warn(f"  {c}")
+    warn("Orderer TLS CA cert not found in any expected location")
     return str(candidates[0].resolve())
 
-
-# ============================================================
-# Peer port reachability gate
-# ============================================================
 
 def _wait_for_peer_port(host: str, port: int, timeout: int = 60) -> bool:
     info(f"Waiting for {host}:{port} to accept connections (up to {timeout}s) ...")
@@ -379,10 +290,6 @@ def _wait_for_peer_port(host: str, port: int, timeout: int = 60) -> bool:
             time.sleep(2)
     return False
 
-
-# ============================================================
-# Docker helpers — peer ledger reset
-# ============================================================
 
 def _get_compose_project_name() -> str:
     result = subprocess.run(
@@ -401,10 +308,8 @@ def _get_compose_project_name() -> str:
 
 
 def _reset_peer_ledger(peer_service: str = "peer0.org1.example.com"):
-    warn(f"Resetting peer ledger for {peer_service} to clear stale block hashes ...")
-
+    warn(f"Resetting peer ledger for {peer_service} ...")
     subprocess.call(["docker", "compose", "rm", "-sf", peer_service])
-
     project = _get_compose_project_name()
     volume_candidates = [
         f"{project}_peer0data",
@@ -414,8 +319,7 @@ def _reset_peer_ledger(peer_service: str = "peer0.org1.example.com"):
     for vol in volume_candidates:
         r = subprocess.call(
             ["docker", "volume", "rm", vol],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         if r == 0:
             ok(f"Removed Docker volume: {vol}")
@@ -429,14 +333,11 @@ def _reset_peer_ledger(peer_service: str = "peer0.org1.example.com"):
             if "peer0" in vname.lower():
                 subprocess.call(
                     ["docker", "volume", "rm", vname],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
                 ok(f"Removed Docker volume: {vname}")
-
-    info(f"Recreating {peer_service} container with empty ledger ...")
+    info(f"Recreating {peer_service} container ...")
     subprocess.check_call(["docker", "compose", "up", "-d", peer_service])
-    info("Waiting 10 s for peer to initialise ...")
     time.sleep(10)
 
 
@@ -447,14 +348,11 @@ def _reset_peer_ledger(peer_service: str = "peer0.org1.example.com"):
 def _peer_run(args: list, env: dict) -> subprocess.CompletedProcess:
     return subprocess.run(args, env=env, capture_output=True, text=True)
 
-
 def _channel_exists(channel: str, env: dict) -> bool:
     r = _peer_run(["peer", "channel", "list"], env)
     return channel in r.stdout
 
-
-def _channel_exists_on_orderer(channel: str, orderer_addr: str,
-                                orderer_tls: str, env: dict) -> bool:
+def _channel_exists_on_orderer(channel, orderer_addr, orderer_tls, env):
     if shutil.which("osnadmin"):
         orderer_admin_addr = orderer_addr.replace("7050", "7053")
         orderer_tls_dir = Path(orderer_tls).parent.parent
@@ -463,23 +361,19 @@ def _channel_exists_on_orderer(channel: str, orderer_addr: str,
         r = subprocess.run([
             "osnadmin", "channel", "list",
             "--orderer-address", orderer_admin_addr,
-            "--ca-file",         orderer_tls,
-            "--client-cert",     admin_cert,
-            "--client-key",      admin_key,
+            "--ca-file", orderer_tls,
+            "--client-cert", admin_cert,
+            "--client-key", admin_key,
         ], capture_output=True, text=True)
         if r.returncode == 0:
             try:
                 data = json.loads(r.stdout)
-                channels = [c["name"] for c in data.get("channels", [])]
-                return channel in channels
+                return channel in [c["name"] for c in data.get("channels", [])]
             except Exception:
                 return channel in r.stdout
-
     r = _peer_run([
-        "peer", "channel", "fetch", "0",
-        "/dev/null",
-        "-c", channel,
-        "-o", orderer_addr,
+        "peer", "channel", "fetch", "0", "/dev/null",
+        "-c", channel, "-o", orderer_addr,
         "--ordererTLSHostnameOverride", "orderer.example.com",
         "--tls", "--cafile", orderer_tls,
     ], env)
@@ -488,43 +382,29 @@ def _channel_exists_on_orderer(channel: str, orderer_addr: str,
         return False
     return r.returncode == 0
 
-
-def _peer_ledger_synced(channel: str, orderer_addr: str, orderer_tls: str,
-                        env: dict, timeout: int = 60) -> bool:
+def _peer_ledger_synced(channel, orderer_addr, orderer_tls, env, timeout=60):
     info(f"Waiting for peer ledger to sync on {channel} (up to {timeout}s) ...")
     deadline = time.time() + timeout
     while time.time() < deadline:
         r = _peer_run(["peer", "channel", "getinfo", "-c", channel], env)
         if r.returncode == 0 and "Blockchain info" in r.stdout:
-            ok("Peer ledger synced and deliver stream ready")
+            ok("Peer ledger synced")
             return True
-        combined = (r.stdout + r.stderr).lower()
-        if "eof" in combined or "unavailable" in combined or "not found" in combined:
-            time.sleep(3)
-            continue
-        if r.returncode != 0:
-            warn(f"getinfo returned: {r.stderr.strip()[:120]}")
-            time.sleep(3)
-            continue
+        time.sleep(3)
     return False
 
-
-def _chaincode_installed(name: str, peer_addr: str, tls_cert: str, env: dict) -> bool:
+def _chaincode_installed(name, peer_addr, tls_cert, env):
     r = _peer_run([
         "peer", "lifecycle", "chaincode", "queryinstalled",
         "--peerAddresses", peer_addr, "--tlsRootCertFiles", tls_cert,
     ], env)
     return name in r.stdout
 
-
-def _orderer_reachable(orderer_addr: str, orderer_tls: str,
-                       channel: str, env: dict) -> bool:
+def _orderer_reachable(orderer_addr, orderer_tls, channel, env):
     r = _peer_run([
         "peer", "lifecycle", "chaincode", "checkcommitreadiness",
-        "--channelID", channel,
-        "--name", "security_logger",
-        "--version", "1.0", "--sequence", "1",
-        "--output", "json",
+        "--channelID", channel, "--name", "security_logger",
+        "--version", "1.0", "--sequence", "1", "--output", "json",
         "-o", orderer_addr,
         "--ordererTLSHostnameOverride", "orderer.example.com",
         "--tls", "--cafile", orderer_tls,
@@ -535,29 +415,23 @@ def _orderer_reachable(orderer_addr: str, orderer_tls: str,
             return False
     return True
 
-
-def _chaincode_approved(channel: str, name: str, sequence: str,
-                        orderer_addr: str, orderer_tls: str, env: dict) -> bool:
+def _chaincode_approved(channel, name, sequence, orderer_addr, orderer_tls, env):
     r = _peer_run([
         "peer", "lifecycle", "chaincode", "checkcommitreadiness",
         "--channelID", channel, "--name", name,
-        "--version", "1.0", "--sequence", sequence,
-        "--output", "json",
+        "--version", "1.0", "--sequence", sequence, "--output", "json",
         "-o", orderer_addr,
         "--ordererTLSHostnameOverride", "orderer.example.com",
         "--tls", "--cafile", orderer_tls,
     ], env)
     if r.returncode != 0:
-        warn(f"checkcommitreadiness returned {r.returncode} — assuming not yet approved")
         return False
     try:
-        data = json.loads(r.stdout)
-        return data.get("approvals", {}).get("Org1MSP", False) is True
-    except (json.JSONDecodeError, AttributeError):
+        return json.loads(r.stdout).get("approvals", {}).get("Org1MSP", False) is True
+    except Exception:
         return "Org1MSP: true" in r.stdout
 
-
-def _chaincode_committed(channel: str, name: str, env: dict) -> bool:
+def _chaincode_committed(channel, name, env):
     r = _peer_run([
         "peer", "lifecycle", "chaincode", "querycommitted",
         "--channelID", channel, "--name", name,
@@ -629,29 +503,22 @@ def check_prereqs() -> bool:
 def _generate_agent_keypair():
     key_path  = Path("crypto-config/agent/keystore/agent_sk")
     cert_path = Path("crypto-config/agent/signcerts/agent.pem")
-
     if key_path.exists() and cert_path.exists():
         ok("Agent keypair already exists — skipping")
         return
-
     info("Generating agent EC keypair (P-256) ...")
-
     try:
         from cryptography.hazmat.primitives.asymmetric import ec
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography import x509
         from cryptography.x509.oid import NameOID
     except ImportError:
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "cryptography", "-q"]
-        )
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "cryptography", "-q"])
         from cryptography.hazmat.primitives.asymmetric import ec
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography import x509
         from cryptography.x509.oid import NameOID
-
     private_key = ec.generate_private_key(ec.SECP256R1())
-
     subject = issuer = x509.Name([
         x509.NameAttribute(NameOID.COMMON_NAME, "audit-agent"),
         x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Org1MSP"),
@@ -659,8 +526,7 @@ def _generate_agent_keypair():
     now = _dt.datetime.now(_dt.timezone.utc)
     cert = (
         x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(issuer)
+        .subject_name(subject).issuer_name(issuer)
         .public_key(private_key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(now)
@@ -668,19 +534,14 @@ def _generate_agent_keypair():
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         .sign(private_key, hashes.SHA256())
     )
-
     key_path.parent.mkdir(parents=True, exist_ok=True)
-    key_path.write_bytes(
-        private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
-    )
-
+    key_path.write_bytes(private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
     cert_path.parent.mkdir(parents=True, exist_ok=True)
     cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-
     ok(f"Agent keypair written → {key_path}  /  {cert_path}")
 
 
@@ -690,7 +551,6 @@ def _generate_agent_keypair():
 
 def generate_crypto_and_genesis():
     hdr("Step 2 — Generate Crypto Material & Genesis Block")
-
     crypto_cfg = Path("crypto-config.yaml")
     if not crypto_cfg.exists():
         crypto_cfg.write_text("""\
@@ -709,16 +569,13 @@ PeerOrgs:
       Count: 1
 """)
         info("Written crypto-config.yaml")
-
     Path("channel-artifacts").mkdir(exist_ok=True)
-
     if not Path("crypto-config").exists():
         info("Running cryptogen ...")
         subprocess.check_call(["cryptogen", "generate", "--config=./crypto-config.yaml"])
         ok("crypto-config/ generated")
     else:
         ok("crypto-config/ already exists — skipping")
-
     genesis = Path("channel-artifacts/genesis.block")
     if not genesis.exists():
         info("Running configtxgen (genesis block) ...")
@@ -729,7 +586,6 @@ PeerOrgs:
         ok("genesis.block created")
     else:
         ok("genesis.block already exists — skipping")
-
     ch_tx = Path("channel-artifacts/security-channel.tx")
     if not ch_tx.exists():
         info("Running configtxgen (channel tx) ...")
@@ -740,7 +596,6 @@ PeerOrgs:
         ok("security-channel.tx created")
     else:
         ok("security-channel.tx already exists — skipping")
-
     _generate_agent_keypair()
 
 
@@ -750,11 +605,10 @@ PeerOrgs:
 
 def start_docker_stack():
     hdr("Step 3 — Start Docker Stack")
-    info("Running: docker compose up -d  (this may pull images — ~2 min first time)")
+    info("Running: docker compose up -d  (may pull images ~2 min first time)")
     subprocess.check_call(["docker", "compose", "up", "-d"])
     info("Waiting 30 s for containers to initialise ...")
     time.sleep(30)
-
     result = subprocess.check_output(
         ["docker", "compose", "ps", "--format", "json"], text=True
     ).strip()
@@ -762,10 +616,7 @@ def start_docker_stack():
         services = [json.loads(line) for line in result.splitlines() if line.strip()]
     except Exception:
         services = []
-    running = [
-        s for s in services
-        if isinstance(s, dict) and "running" in str(s.get("State", "")).lower()
-    ]
+    running = [s for s in services if isinstance(s, dict) and "running" in str(s.get("State", "")).lower()]
     ok(f"{len(running)}/{len(services) or '?'} containers running")
 
 
@@ -781,9 +632,7 @@ def teardown_docker_stack():
 
 def setup_channel_and_chaincode():
     hdr("Step 4 — Create Channel & Deploy Chaincode")
-
     inject_etc_hosts()
-
     fabric_cfg = find_fabric_cfg_path()
     info(f"Using FABRIC_CFG_PATH={fabric_cfg}")
 
@@ -800,15 +649,14 @@ def setup_channel_and_chaincode():
              "/peers/peer0.org1.example.com/tls/ca.crt").resolve()
     )
     orderer_tls = _find_orderer_tls_ca()
-    info(f"Orderer TLS CA: {orderer_tls}")
 
     base_env = {
         **os.environ,
-        "FABRIC_CFG_PATH":         fabric_cfg,
-        "CORE_PEER_TLS_ENABLED":   "true",
-        "CORE_PEER_LOCALMSPID":    "Org1MSP",
-        "CORE_PEER_ADDRESS":       PEER_ADDR,
-        "CORE_PEER_MSPCONFIGPATH": str(
+        "FABRIC_CFG_PATH":             fabric_cfg,
+        "CORE_PEER_TLS_ENABLED":       "true",
+        "CORE_PEER_LOCALMSPID":        "Org1MSP",
+        "CORE_PEER_ADDRESS":           PEER_ADDR,
+        "CORE_PEER_MSPCONFIGPATH":     str(
             Path("crypto-config/peerOrganizations/org1.example.com"
                  "/users/Admin@org1.example.com/msp").resolve()
         ),
@@ -820,8 +668,7 @@ def setup_channel_and_chaincode():
 
     if block.exists():
         if not _channel_exists_on_orderer(CHANNEL, ORDERER_ADDR, orderer_tls, base_env):
-            warn(f"{CHANNEL}.block exists locally but orderer has no record of channel.")
-            warn("Deleting stale block and recreating channel on fresh orderer ...")
+            warn(f"{CHANNEL}.block exists locally but orderer has no record — recreating")
             _reset_peer_ledger("peer0.org1.example.com")
             block.unlink()
             force_rejoin = True
@@ -839,21 +686,16 @@ def setup_channel_and_chaincode():
         ], env=base_env)
         ok("Channel created")
     else:
-        ok(f"{CHANNEL}.block exists and orderer confirms channel — skipping create")
+        ok(f"{CHANNEL}.block exists — skipping create")
 
     if not _wait_for_peer_port("peer0.org1.example.com", 7051, timeout=60):
-        err("peer0:7051 did not become reachable within 60 s — check container logs")
+        err("peer0:7051 not reachable within 60 s")
         sys.exit(1)
 
     already_joined = (not force_rejoin) and _channel_exists(CHANNEL, base_env)
-
     if already_joined:
         ok(f"peer0 already joined {CHANNEL}")
     else:
-        if force_rejoin:
-            info("Force-rejoining peer0 to channel (stale ledger cleared) ...")
-        else:
-            info("Joining peer0 to channel ...")
         rc = subprocess.call(
             ["peer", "channel", "join", "-b", str(block.resolve())],
             env=base_env,
@@ -861,15 +703,15 @@ def setup_channel_and_chaincode():
         if rc == 0:
             ok("peer0 joined channel")
         else:
-            err(f"peer channel join failed (rc={rc}) — cannot continue")
+            err(f"peer channel join failed (rc={rc})")
             sys.exit(1)
 
     if not _peer_ledger_synced(CHANNEL, ORDERER_ADDR, orderer_tls, base_env, timeout=90):
-        err("Peer ledger did not sync within 90 s — check peer0 container logs")
+        err("Peer ledger did not sync within 90 s")
         sys.exit(1)
 
     if _chaincode_committed(CHANNEL, CC_NAME, base_env):
-        ok(f"Chaincode '{CC_NAME}' already committed on '{CHANNEL}' — skipping lifecycle")
+        ok(f"Chaincode '{CC_NAME}' already committed — skipping lifecycle")
         return
 
     pkg_tar = Path("security_logger.tar.gz")
@@ -877,8 +719,7 @@ def setup_channel_and_chaincode():
         info("Packaging chaincode ...")
         subprocess.call(["go", "mod", "tidy"], cwd="chaincode")
         subprocess.call([
-            "peer", "lifecycle", "chaincode", "package",
-            str(pkg_tar),
+            "peer", "lifecycle", "chaincode", "package", str(pkg_tar),
             "--path",  str(Path("chaincode").resolve()),
             "--lang",  "golang",
             "--label", f"{CC_NAME}_1.0",
@@ -889,22 +730,18 @@ def setup_channel_and_chaincode():
     if _chaincode_installed(CC_NAME, PEER_ADDR, peer_tls_ca, base_env):
         ok("Chaincode already installed on peer0")
     else:
-        info("Installing chaincode (compiles Go — ~1 min) ...")
+        info("Installing chaincode (~1 min) ...")
         rc = subprocess.call([
-            "peer", "lifecycle", "chaincode", "install",
-            str(pkg_tar),
-            "--peerAddresses",    PEER_ADDR,
-            "--tlsRootCertFiles", peer_tls_ca,
+            "peer", "lifecycle", "chaincode", "install", str(pkg_tar),
+            "--peerAddresses", PEER_ADDR, "--tlsRootCertFiles", peer_tls_ca,
         ], env=base_env)
         if rc != 0:
-            err(f"chaincode install failed (rc={rc}) — cannot continue")
+            err(f"chaincode install failed (rc={rc})")
             sys.exit(1)
 
-    info("Querying installed chaincode ...")
     result = subprocess.run([
         "peer", "lifecycle", "chaincode", "queryinstalled",
-        "--peerAddresses",    PEER_ADDR,
-        "--tlsRootCertFiles", peer_tls_ca,
+        "--peerAddresses", PEER_ADDR, "--tlsRootCertFiles", peer_tls_ca,
     ], env=base_env, capture_output=True, text=True)
     print(result.stdout)
 
@@ -913,53 +750,40 @@ def setup_channel_and_chaincode():
         if f"{CC_NAME}_1.0" in line and "Package ID:" in line:
             pkg_id = line.split("Package ID:")[1].split(",")[0].strip()
             break
-
     if not pkg_id:
-        err("Could not parse package ID — cannot approve or commit")
+        err("Could not parse package ID")
         sys.exit(1)
-
     ok(f"Package ID: {pkg_id}")
 
     if not _orderer_reachable(ORDERER_ADDR, orderer_tls, CHANNEL, base_env):
-        warn("Orderer returned NOT_FOUND for channel — chaincode installed on peer.")
-        warn("Approve+commit requires the orderer to know the channel.")
-        warn("The stack will continue; services will use peer-side endorsement only.")
+        warn("Orderer NOT_FOUND for channel — skipping approve+commit")
         return
 
     if _chaincode_approved(CHANNEL, CC_NAME, CC_SEQUENCE, ORDERER_ADDR, orderer_tls, base_env):
-        ok("Chaincode already approved for Org1 — skipping approveformyorg")
+        ok("Chaincode already approved — skipping approveformyorg")
     else:
         info("Approving chaincode for Org1 ...")
         rc = subprocess.call([
             "peer", "lifecycle", "chaincode", "approveformyorg",
-            "-o", ORDERER_ADDR,
-            "--ordererTLSHostnameOverride", ORDERER_HOSTNAME,
-            "--channelID",  CHANNEL,
-            "--name",       CC_NAME,
-            "--version",    CC_VERSION,
-            "--package-id", pkg_id,
-            "--sequence",   CC_SEQUENCE,
+            "-o", ORDERER_ADDR, "--ordererTLSHostnameOverride", ORDERER_HOSTNAME,
+            "--channelID", CHANNEL, "--name", CC_NAME,
+            "--version", CC_VERSION, "--package-id", pkg_id, "--sequence", CC_SEQUENCE,
             "--tls", "--cafile", orderer_tls,
-            "--peerAddresses",    PEER_ADDR,
-            "--tlsRootCertFiles", peer_tls_ca,
+            "--peerAddresses", PEER_ADDR, "--tlsRootCertFiles", peer_tls_ca,
         ], env=base_env)
         if rc != 0:
-            err(f"approveformyorg failed (rc={rc}) — check orderer TLS CA path")
+            err(f"approveformyorg failed (rc={rc})")
             sys.exit(1)
         ok("Chaincode approved")
 
     info("Committing chaincode ...")
     rc = subprocess.call([
         "peer", "lifecycle", "chaincode", "commit",
-        "-o", ORDERER_ADDR,
-        "--ordererTLSHostnameOverride", ORDERER_HOSTNAME,
-        "--channelID", CHANNEL,
-        "--name",      CC_NAME,
-        "--version",   CC_VERSION,
-        "--sequence",  CC_SEQUENCE,
+        "-o", ORDERER_ADDR, "--ordererTLSHostnameOverride", ORDERER_HOSTNAME,
+        "--channelID", CHANNEL, "--name", CC_NAME,
+        "--version", CC_VERSION, "--sequence", CC_SEQUENCE,
         "--tls", "--cafile", orderer_tls,
-        "--peerAddresses",    PEER_ADDR,
-        "--tlsRootCertFiles", peer_tls_ca,
+        "--peerAddresses", PEER_ADDR, "--tlsRootCertFiles", peer_tls_ca,
     ], env=base_env)
     if rc == 0:
         ok("Chaincode committed — fully deployed on security-channel")
@@ -983,8 +807,7 @@ def wait_for_port(port: int, timeout: int = 60) -> bool:
     return False
 
 
-def _wait_for_log_line(log_path: Path, marker: str, proc,
-                       timeout: int = 60) -> bool:
+def _wait_for_log_line(log_path, marker, proc, timeout=60):
     deadline = time.time() + timeout
     while time.time() < deadline:
         if proc.poll() is not None:
@@ -993,10 +816,6 @@ def _wait_for_log_line(log_path: Path, marker: str, proc,
             content = log_path.read_text(errors="replace")
             if marker in content:
                 return True
-            lines = content.splitlines()
-            for line in lines[-5:]:
-                if "ERROR" in line and "Retrying" not in line and "DLQ" not in line:
-                    return False
         time.sleep(0.5)
     return False
 
@@ -1010,7 +829,6 @@ _SERVICES = [
 
 def start_services():
     hdr("Step 5 — Start Python Microservices")
-    venv_python, _ = ensure_venv()
 
     fabric_bin = inject_fabric_bin_into_path()
     if fabric_bin:
@@ -1018,7 +836,6 @@ def start_services():
 
     repo_root = str(Path(__file__).parent.resolve())
     os.environ["BLOCKCHAIN_LOGGER_REPO_ROOT"] = repo_root
-    info(f"BLOCKCHAIN_LOGGER_REPO_ROOT set to: {repo_root}")
 
     procs = []
     for name, script, health in _SERVICES:
@@ -1028,13 +845,12 @@ def start_services():
             sys.exit(1)
         log_path = Path(f"results/{name}.log")
         log_path.parent.mkdir(exist_ok=True)
-        log_fh   = open(log_path, "w")
-        svc_dir  = str(script_path.parent.resolve())
+        log_fh  = open(log_path, "w")
+        svc_dir = str(script_path.parent.resolve())
         p = subprocess.Popen(
-            [venv_python, "app.py"],
+            [sys.executable, "app.py"],
             cwd=svc_dir,
-            stdout=log_fh,
-            stderr=log_fh,
+            stdout=log_fh, stderr=log_fh,
             env=os.environ.copy(),
         )
         port_str = f":{health}" if isinstance(health, int) else "(worker)"
@@ -1050,7 +866,6 @@ def start_services():
         else:
             ready = _wait_for_log_line(log_path, health, p, timeout=60)
             label = f"log marker '{health}'"
-
         if ready:
             ok(f"{name} is up ({label})")
         else:
@@ -1058,12 +873,10 @@ def start_services():
             if log_path.exists():
                 lines = log_path.read_text(errors="replace").strip().splitlines()
                 tail = "\n    ".join(lines[-12:]) if lines else "(empty)"
-            err(f"{name} did NOT become ready ({label}) within 60 s")
+            err(f"{name} did NOT become ready within 60 s")
             err(f"  Last log lines:\n    {tail}")
-            err("Live stack requires all services to be healthy. Fix the error above then re-run.")
             for n2, p2, _, fh2 in procs:
-                p2.terminate()
-                fh2.close()
+                p2.terminate(); fh2.close()
                 info(f"Stopped {n2}")
             sys.exit(1)
 
@@ -1076,11 +889,10 @@ def start_services():
 
 def run_live_demo_and_benchmark() -> dict:
     import requests
-
     DETECTOR_URL = os.getenv("DETECTOR_URL", "http://localhost:8000")
     AUDIT_URL    = os.getenv("AUDIT_URL",    "http://localhost:8001")
 
-    hdr("Step 6 — Ingest Test Events (live Fabric+IPFS+Kafka)")
+    hdr("Step 6 — Ingest Test Events")
     for ev in SAMPLE_EVENTS:
         try:
             r = requests.post(f"{DETECTOR_URL}/api/v1/events", json=ev, timeout=10)
@@ -1094,7 +906,7 @@ def run_live_demo_and_benchmark() -> dict:
     info("Waiting 15 s for blockchain-logger to commit all events ...")
     time.sleep(15)
 
-    hdr("Step 7 — Query Audit Trail (live Redis → Fabric)")
+    hdr("Step 7 — Query Audit Trail")
     try:
         r = requests.post(
             f"{AUDIT_URL}/api/v1/audit/trail",
@@ -1104,7 +916,7 @@ def run_live_demo_and_benchmark() -> dict:
         r.raise_for_status()
         records = r.json()
         if not records:
-            err("Audit trail returned [] for aws-ec2-i-001 — logger may not have committed yet")
+            err("Audit trail returned [] — logger may not have committed yet")
             sys.exit(1)
         print(json.dumps(records, indent=2))
         ok(f"{len(records)} record(s) found on live ledger")
@@ -1112,23 +924,22 @@ def run_live_demo_and_benchmark() -> dict:
         err(f"Audit query failed: {e}")
         sys.exit(1)
 
-    hdr("Step 8 — Integrity Verification (live IPFS + ECDSA)")
+    hdr("Step 8 — Integrity Verification")
     first_event_id = records[0].get("event_id")
     if first_event_id:
         try:
             r = requests.get(f"{AUDIT_URL}/api/v1/verify/{first_event_id}", timeout=30)
             r.raise_for_status()
             result = r.json()
-            status = result.get("status")
-            if status != "VALID":
-                err(f"Integrity check returned status={status} — expected VALID")
+            if result.get("status") != "VALID":
+                err(f"Integrity check returned status={result.get('status')}")
                 sys.exit(1)
             ok(f"Integrity VALID  event_id={first_event_id[:16]}...")
         except Exception as e:
             err(f"Verify call failed: {e}")
             sys.exit(1)
 
-    hdr("Step 9 — Compliance Report (live)")
+    hdr("Step 9 — Compliance Report")
     try:
         r = requests.post(f"{AUDIT_URL}/api/v1/compliance/report", json={
             "standard": "ISO-27001",
@@ -1139,31 +950,27 @@ def run_live_demo_and_benchmark() -> dict:
     except Exception as e:
         warn(f"Compliance report failed: {e}")
 
-    hdr("Step 10 — Live Benchmark (500 events against real Fabric/IPFS stack)")
+    hdr("Step 10 — Live Benchmark (500 events)")
     latencies, errors = [], 0
     t_start = time.perf_counter()
     for i in range(500):
         ev = {**SAMPLE_EVENTS[i % len(SAMPLE_EVENTS)], "asset_id": f"bench-asset-{i % 50}"}
         t0 = time.perf_counter()
         try:
-            requests.post(
-                f"{DETECTOR_URL}/api/v1/events", json=ev, timeout=10
-            ).raise_for_status()
+            requests.post(f"{DETECTOR_URL}/api/v1/events", json=ev, timeout=10).raise_for_status()
             latencies.append((time.perf_counter() - t0) * 1000)
         except Exception:
             errors += 1
     total_time = time.perf_counter() - t_start
-    n = len(latencies)
+    n    = len(latencies)
     tps  = 500 / total_time
     p50  = statistics.median(latencies) if n else 0
     p95  = sorted(latencies)[int(0.95 * n)] if n else 0
     p99  = sorted(latencies)[int(0.99 * n)] if n else 0
     mean = statistics.mean(latencies) if n else 0
-    ok(f"Benchmark (LIVE): {tps:.0f} TPS  errors={errors}  "
-       f"mean={mean:.1f}ms  p95={p95:.1f}ms  p99={p99:.1f}ms")
-
+    ok(f"Benchmark: {tps:.0f} TPS  errors={errors}  mean={mean:.1f}ms  p95={p95:.1f}ms  p99={p99:.1f}ms")
     if errors > 50:
-        err(f"{errors}/500 benchmark events failed — Fabric pipeline unhealthy")
+        err(f"{errors}/500 benchmark events failed")
         sys.exit(1)
 
     return {
@@ -1226,14 +1033,11 @@ def print_and_save_results(results: dict):
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Objective 2 — Live end-to-end executor (no mock paths)"
-    )
-    parser.add_argument("--teardown",     action="store_true", help="Stop Docker stack")
-    parser.add_argument("--results-only", action="store_true", help="Print last results")
-    parser.add_argument("--skip-docker",  action="store_true", help="Skip Docker/channel steps")
-    parser.add_argument("--inject-hosts", action="store_true",
-                        help="Only inject Fabric hostnames into /etc/hosts then exit")
+    parser = argparse.ArgumentParser(description="Objective 2 — Live end-to-end executor")
+    parser.add_argument("--teardown",     action="store_true")
+    parser.add_argument("--results-only", action="store_true")
+    parser.add_argument("--skip-docker",  action="store_true")
+    parser.add_argument("--inject-hosts", action="store_true")
     args = parser.parse_args()
 
     print(f"""
@@ -1247,20 +1051,17 @@ def main():
     if args.inject_hosts:
         inject_etc_hosts()
         return
-
     if args.results_only:
         if RESULTS_FILE.exists():
             print(RESULTS_FILE.read_text())
         else:
-            warn("No results file found — run without --results-only first")
+            warn("No results file found")
         return
-
     if args.teardown:
         teardown_docker_stack()
         return
 
-    prereqs_ok = check_prereqs()
-    if not prereqs_ok:
+    if not check_prereqs():
         err("Prerequisites or required env vars missing. Fix above errors then re-run.")
         sys.exit(1)
 
@@ -1270,18 +1071,16 @@ def main():
         setup_channel_and_chaincode()
 
     procs = start_services()
-
     results = run_live_demo_and_benchmark()
     print_and_save_results(results)
 
-    info("All live checks passed. Leaving services running. Press Ctrl+C to stop.")
+    info("All live checks passed. Services running. Press Ctrl+C to stop.")
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         for name, p, _, fh in procs:
-            p.terminate()
-            fh.close()
+            p.terminate(); fh.close()
             info(f"Stopped {name}")
 
 
