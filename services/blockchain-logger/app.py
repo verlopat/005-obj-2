@@ -6,13 +6,6 @@ Kafka -> IPFS -> Hyperledger Fabric -> Redis pipeline.
 Fabric transport: peer CLI subprocess (shell=False, no SDK, Python-3.14-safe).
 All cert/key paths resolved to absolute strings anchored at REPO_ROOT so
 relative values in .env work regardless of process working directory.
-
-peer binary resolution order:
-  1. FABRIC_BIN_DIR env var (set by run.py to fabric-samples/bin)
-  2. fabric-samples/bin/ sibling of FABRIC_CFG_PATH  (auto-detect)
-  3. System PATH  (shutil.which fallback)
-This ensures the logger always finds 'peer' regardless of whether the
-operator's shell PATH was inherited by the subprocess.
 """
 from __future__ import annotations
 
@@ -35,6 +28,10 @@ from typing import Optional
 # Priority:
 #   1. BLOCKCHAIN_LOGGER_REPO_ROOT env var  (set by run.py -- most reliable)
 #   2. Path(__file__).resolve() walk-up     (fallback when running directly)
+#
+# Using an env var lets run.py inject the exact absolute path it already
+# knows, bypassing any special-character issues in __file__ resolution
+# (e.g. parentheses in directory names on some shells).
 
 _repo_from_env = os.environ.get("BLOCKCHAIN_LOGGER_REPO_ROOT", "").strip()
 if _repo_from_env:
@@ -95,52 +92,6 @@ _FABRIC_CFG_PATH: str = _abs(
                    str(REPO_ROOT / "fabric-samples" / "config"))
 )
 
-
-def _resolve_peer_bin() -> str:
-    """
-    Resolve the absolute path to the `peer` binary.
-
-    Resolution order:
-      1. FABRIC_BIN_DIR env var explicitly set by run.py
-      2. fabric-samples/bin/ sibling next to FABRIC_CFG_PATH
-         (FABRIC_CFG_PATH = .../fabric-samples/config  →  bin is sibling)
-      3. System PATH via shutil.which
-
-    Returns the first existing absolute path, or bare "peer" as last resort
-    so the OS-level PATH still gets a chance.
-    """
-    candidates: list[Path] = []
-
-    # 1. Explicit env var (most reliable — set by run.py)
-    bin_dir_env = os.environ.get("FABRIC_BIN_DIR", "").strip()
-    if bin_dir_env:
-        candidates.append(Path(bin_dir_env) / "peer")
-
-    # 2. Auto-detect: fabric-samples/bin is the sibling of fabric-samples/config
-    cfg_path = Path(_FABRIC_CFG_PATH)
-    # FABRIC_CFG_PATH is typically .../fabric-samples/config
-    # so bin dir = cfg_path.parent / "bin"
-    candidates.append(cfg_path.parent / "bin" / "peer")
-    # Also try one level deeper in case cfg_path points to the samples root
-    candidates.append(cfg_path / "bin" / "peer")
-    # And try REPO_ROOT/fabric-samples/bin as fallback
-    candidates.append(REPO_ROOT / "fabric-samples" / "bin" / "peer")
-
-    for c in candidates:
-        if c.exists() and os.access(str(c), os.X_OK):
-            return str(c)
-
-    # 3. System PATH fallback
-    which = shutil.which("peer")
-    if which:
-        return which
-
-    # Return bare name; startup check will catch it and log clearly
-    return "peer"
-
-
-PEER_BIN: str = _resolve_peer_bin()
-
 # Peer TLS CA -- --tlsRootCertFiles
 _PEER_TLS_CA: str = _abs(cfg.FABRIC_TLS_CERT)
 
@@ -181,13 +132,25 @@ _ADMIN_MSP_PATH: str = _resolve_admin_msp()
 # Orderer address (no hardcoding)
 _ORDERER_ADDR: str = cfg.FABRIC_ORDERER_ENDPOINT  # e.g. orderer.example.com:7050
 
+# ---- Hardcoded path to `peer` binary ----
+# This is the ABSOLUTE path that should work regardless of the process environment.
+# We define it as a constant for easy adjustment.
+PEER_BIN = "/home/varamm/Personal/d-study/Papers/pakkodivi/Progress/005_phd/code/005-obj-2/fabric-samples/bin/peer"
+
+# Fallback: if the hardcoded path doesn't exist, try to find `peer` in the system PATH.
+if not os.path.exists(PEER_BIN) or not os.access(PEER_BIN, os.X_OK):
+    found = shutil.which("peer")
+    if found:
+        PEER_BIN = found
+        log.warning("Hardcoded peer not found, using PATH: %s", PEER_BIN)
+    else:
+        log.error("No peer binary found anywhere. Set PEER_BIN to correct path.")
+        sys.exit(1)
+else:
+    log.info("Using peer binary: %s", PEER_BIN)
+
 
 def _log_fabric_paths() -> None:
-    # --- DEBUG: show the PATH the process inherited ---
-    inherited_path = os.environ.get("PATH", "")
-    log.info("PATH in logger: %s", inherited_path)
-    log.info("Resolved PEER_BIN: %s  exists=%s", PEER_BIN, Path(PEER_BIN).exists())
-    # --------------------------------------------------
     log.info("REPO_ROOT = %s", REPO_ROOT)
     log.info("Fabric CLI paths (all absolute):")
     for label, p in [
@@ -195,6 +158,7 @@ def _log_fabric_paths() -> None:
         ("PEER_TLS_CA     ", _PEER_TLS_CA),
         ("ORDERER_TLS_CA  ", _ORDERER_TLS_CA),
         ("ADMIN_MSP_PATH  ", _ADMIN_MSP_PATH),
+        ("PEER_BIN        ", PEER_BIN),
     ]:
         log.info("  %s = %s  exists=%s", label, p, Path(p).exists())
     log.info("  ORDERER_ADDR         = %s", _ORDERER_ADDR)
@@ -212,19 +176,14 @@ def _peer_env() -> dict:
     env["CORE_PEER_ADDRESS"]           = cfg.FABRIC_PEER_ENDPOINT
     env["CORE_PEER_MSPCONFIGPATH"]     = _ADMIN_MSP_PATH
     env["CORE_PEER_TLS_ROOTCERT_FILE"] = _PEER_TLS_CA
-    # Ensure the fabric bin directory is on PATH inside the subprocess too,
-    # regardless of what PATH the parent process inherited.
-    peer_bin_dir = str(Path(PEER_BIN).parent)
-    existing_path = env.get("PATH", "")
-    if peer_bin_dir not in existing_path.split(os.pathsep):
-        env["PATH"] = peer_bin_dir + os.pathsep + existing_path
     return env
 
 
 def _submit_to_fabric(event: SecurityEvent) -> str:
     """
     Invoke LogEvent chaincode via `peer chaincode invoke`.
-    Uses the resolved PEER_BIN absolute path — shell=False, no PATH lookup.
+    Uses shell=False with an explicit list -- each element is passed
+    directly to execvp(), no shell interpretation, safe with any path.
     """
     payload_str = json.dumps(event.to_ledger_dict(), default=str)
     invoke_spec = json.dumps({"Args": ["LogEvent", payload_str]})
@@ -246,8 +205,6 @@ def _submit_to_fabric(event: SecurityEvent) -> str:
         "--waitForEvent",
         "--waitForEventTimeout", f"{cfg.FABRIC_INVOKE_TIMEOUT_S}s",
     ]
-
-    log.debug("peer invoke cmd[0]: %s", cmd[0])
 
     result = subprocess.run(
         cmd,
@@ -394,25 +351,10 @@ def main() -> None:
     log.info("blockchain-logger starting")
     _log_fabric_paths()
 
-    # Validate peer binary: use the resolved PEER_BIN, not bare "peer" on PATH.
-    # This catches missing binaries before any message is consumed.
-    peer_bin_path = Path(PEER_BIN)
-    if not peer_bin_path.is_absolute() or not peer_bin_path.exists():
-        # Final fallback: re-check system PATH in case it was updated after import
-        which_peer = shutil.which("peer")
-        if not which_peer:
-            log.error(
-                "'peer' binary not found. Resolved path: %s  "
-                "Set FABRIC_BIN_DIR=/path/to/fabric-samples/bin in .env "
-                "or ensure 'peer' is on PATH.",
-                PEER_BIN,
-            )
-            sys.exit(1)
-        log.warning(
-            "PEER_BIN (%s) not found via auto-detect; "
-            "falling back to PATH-discovered: %s",
-            PEER_BIN, which_peer,
-        )
+    # Double-check that the peer binary is executable
+    if not os.path.exists(PEER_BIN) or not os.access(PEER_BIN, os.X_OK):
+        log.error("Peer binary not found or not executable: %s", PEER_BIN)
+        sys.exit(1)
 
     missing = [p for p in [_PEER_TLS_CA, _ORDERER_TLS_CA, _ADMIN_MSP_PATH]
                if not Path(p).exists()]
