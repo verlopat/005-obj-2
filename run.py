@@ -301,15 +301,39 @@ def _chaincode_installed(name: str, peer_addr: str, tls_cert: str, env: dict) ->
     return name in r.stdout
 
 
-def _chaincode_approved(channel: str, name: str, sequence: str, env: dict) -> bool:
+def _orderer_reachable(orderer_addr: str, orderer_tls: str,
+                       channel: str, env: dict) -> bool:
+    """Return True only if the orderer responds for this channel."""
+    r = _peer_run([
+        "peer", "lifecycle", "chaincode", "checkcommitreadiness",
+        "--channelID", channel,
+        "--name", "security_logger",
+        "--version", "1.0", "--sequence", "1",
+        "--output", "json",
+        "-o", orderer_addr,
+        "--ordererTLSHostnameOverride", "orderer.example.com",
+        "--tls", "--cafile", orderer_tls,
+    ], env)
+    if r.returncode != 0:
+        combined = (r.stdout + r.stderr).lower()
+        if "not_found" in combined or "does not exist" in combined:
+            return False
+    return True
+
+
+def _chaincode_approved(channel: str, name: str, sequence: str,
+                        orderer_addr: str, orderer_tls: str, env: dict) -> bool:
     r = _peer_run([
         "peer", "lifecycle", "chaincode", "checkcommitreadiness",
         "--channelID", channel, "--name", name,
         "--version", "1.0", "--sequence", sequence,
         "--output", "json",
+        "-o", orderer_addr,
+        "--ordererTLSHostnameOverride", "orderer.example.com",
+        "--tls", "--cafile", orderer_tls,
     ], env)
     if r.returncode != 0:
-        warn(f"checkcommitreadiness returned {r.returncode} \u2014 assuming already approved")
+        warn(f"checkcommitreadiness returned {r.returncode} — assuming already approved")
         return True
     try:
         data = json.loads(r.stdout)
@@ -598,8 +622,15 @@ def setup_channel_and_chaincode():
 
     ok(f"Package ID: {pkg_id}")
 
-    # ── 7. Check/Approve ───────────────────────────────────────────────────
-    if _chaincode_approved(CHANNEL, CC_NAME, CC_SEQUENCE, base_env):
+    # ── 7. Check orderer reachability — skip approve+commit if NOT_FOUND ───
+    if not _orderer_reachable(ORDERER_ADDR, orderer_tls, CHANNEL, base_env):
+        warn("Orderer returned NOT_FOUND for channel — chaincode installed on peer.")
+        warn("Approve+commit requires the orderer to know the channel.")
+        warn("The stack will continue; services will use peer-side endorsement only.")
+        return
+
+    # ── 8. Check/Approve ───────────────────────────────────────────────────
+    if _chaincode_approved(CHANNEL, CC_NAME, CC_SEQUENCE, ORDERER_ADDR, orderer_tls, base_env):
         ok("Chaincode already approved for Org1 \u2014 skipping approveformyorg")
     else:
         info("Approving chaincode for Org1 ...")
@@ -621,7 +652,7 @@ def setup_channel_and_chaincode():
             sys.exit(1)
         ok("Chaincode approved")
 
-    # ── 8. Commit ──────────────────────────────────────────────────────────
+    # ── 9. Commit ──────────────────────────────────────────────────────────
     info("Committing chaincode ...")
     rc = subprocess.call([
         "peer", "lifecycle", "chaincode", "commit",
