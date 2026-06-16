@@ -12,6 +12,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+# Repo root = two levels up from this file  (shared/config.py -> shared/ -> repo/)
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
 
 def _require(name: str) -> str:
     """Return env var value or raise immediately — no silent fallback."""
@@ -28,13 +31,14 @@ def _optional(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
 
-# ── Mode flag ────────────────────────────────────────────────────────────────
+# ── Mode flag ────────────────────────────────────────────────────────────────────────
 # LIVE_MODE=1  →  all required vars enforced, no mock fallback (default)
 # LIVE_MODE=0  →  unit-test mode; callers must mock every external dependency
 LIVE_MODE: bool = _optional("LIVE_MODE", "1") != "0"
 
 
-# ── Kafka ────────────────────────────────────────────────────────────────────
+# ── Kafka ───────────────────────────────────────────────────────────────────────────
+
 KAFKA_BOOTSTRAP_SERVERS: str = (
     _require("KAFKA_BOOTSTRAP_SERVERS") if LIVE_MODE
     else _optional("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
@@ -46,7 +50,8 @@ KAFKA_CONSUMER_GROUP: str  = _optional("KAFKA_CONSUMER_GROUP", "blockchain-logge
 KAFKA_AUTO_COMMIT: bool    = False  # always manual — never change this
 
 
-# ── Hyperledger Fabric ───────────────────────────────────────────────────────
+# ── Hyperledger Fabric ─────────────────────────────────────────────────────────────
+
 FABRIC_PEER_ENDPOINT: str  = _optional("FABRIC_PEER_ENDPOINT", "localhost:7051")
 FABRIC_CHANNEL: str        = _optional("FABRIC_CHANNEL",       "security-channel")
 FABRIC_CHAINCODE: str      = _optional("FABRIC_CHAINCODE",     "security_logger")
@@ -77,7 +82,8 @@ FABRIC_RETRY_BACKOFF_S: float    = float(_optional("FABRIC_RETRY_BACKOFF_S", "2.
 FABRIC_INVOKE_TIMEOUT_S: int     = int(_optional("FABRIC_INVOKE_TIMEOUT_S", "60"))
 
 
-# ── IPFS ─────────────────────────────────────────────────────────────────────
+# ── IPFS ──────────────────────────────────────────────────────────────────────────────
+
 IPFS_API_URL: str = (
     _require("IPFS_API_URL") if LIVE_MODE
     else _optional("IPFS_API_URL", "http://127.0.0.1:5001")
@@ -87,7 +93,7 @@ IPFS_TIMEOUT_S: int = int(_optional("IPFS_TIMEOUT_S", "30"))
 IPFS_PIN: bool = _optional("IPFS_PIN", "1") == "1"
 
 
-# ── Shared durable cache (Redis) ─────────────────────────────────────────────
+# ── Shared durable cache (Redis) ────────────────────────────────────────────────────
 # The blockchain logger writes committed records here so the audit-api can
 # query them across process boundaries without querying the Fabric peer for
 # every read request.  Required in live mode so the two services share state.
@@ -101,21 +107,31 @@ REDIS_IDX_ASSET: str  = _optional("REDIS_IDX_ASSET",  "audit:idx:asset:")
 REDIS_IDX_SEV: str    = _optional("REDIS_IDX_SEV",    "audit:idx:severity:")
 
 
-# ── PKI / signing ─────────────────────────────────────────────────────────────
-AGENT_KEY_PATH: str  = _optional("AGENT_KEY_PATH",  "crypto-config/agent/keystore/agent_sk")
-AGENT_CERT_PATH: str = _optional("AGENT_CERT_PATH", "crypto-config/agent/signcerts/agent.pem")
+# ── PKI / signing ────────────────────────────────────────────────────────────────────
+#
+# Default paths are anchored to the repo root (two levels up from this file)
+# so that every service finds the files regardless of its working directory.
+# Override via env vars if the keys live elsewhere.
+#
+_default_agent_key  = str(_REPO_ROOT / "crypto-config" / "agent" / "keystore" / "agent_sk")
+_default_agent_cert = str(_REPO_ROOT / "crypto-config" / "agent" / "signcerts" / "agent.pem")
+
+AGENT_KEY_PATH: str  = _optional("AGENT_KEY_PATH",  _default_agent_key)
+AGENT_CERT_PATH: str = _optional("AGENT_CERT_PATH", _default_agent_cert)
 
 # AES key for IPFS payload encryption — must live outside the repo
 AES_KEY_PATH: str    = _optional("AES_KEY_PATH", ".aes_key")
 
 
-# ── API service ports ─────────────────────────────────────────────────────────
+# ── API service ports ───────────────────────────────────────────────────────────────────
+
 DETECTOR_PORT: int  = int(_optional("DETECTOR_PORT",  "8000"))
 AUDIT_API_PORT: int = int(_optional("AUDIT_API_PORT", "8001"))
 LOGGER_PORT: int    = int(_optional("LOGGER_PORT",    "8002"))
 
 
 # ── Convenience: print all live settings on import (debug) ───────────────────
+
 def dump() -> dict:
     """Return a redacted config dict — safe to log."""
     return {
