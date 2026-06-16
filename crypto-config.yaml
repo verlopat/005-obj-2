@@ -1,0 +1,21 @@
+# crypto-config.yaml
+# Hyperledger Fabric cryptogen configuration for Objective 2
+# Generates TLS + signing material for orderer, peers, and the detection agent.
+#
+# Usage (handled automatically by run.py Step 2):
+#   cryptogen generate --config=crypto-config.yaml --output=crypto-config
+
+OrdererOrgs:
+  - Name: Orderer
+    Domain: example.com
+    Specs:
+      - Hostname: orderer
+
+PeerOrgs:
+  - Name: Org1
+    Domain: org1.example.com
+    EnableNodeOUs: true
+    Template:
+      Count: 2          # peer0 + peer1
+    Users:
+      Count: 1          # User1 (in addition to Admin)
